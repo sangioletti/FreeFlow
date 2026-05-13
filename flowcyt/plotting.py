@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 from matplotlib.patches import Polygon as MplPolygon
 
-from .gating import Gate, QuadrantGate
+from .gating import Gate, QuadrantGate, ThresholdGate
 
 
 # ------------------------------------------------------------------ #
@@ -133,16 +133,26 @@ def density_scatter(
 #  Gate overlays
 # ------------------------------------------------------------------ #
 
-def draw_gate_overlay(ax, gate: Gate, linewidth: float = 2.0):
-    """Draw the outline of a gate on *ax*."""
+def draw_gate_overlay(ax, gate: Gate, linewidth: float = 2.0,
+                      label_text: str | None = None):
+    """Draw the outline of a gate on *ax*.
+
+    *label_text* overrides the default label (gate.name).
+    """
     # Special handling for QuadrantGate — draw crosshair lines
     if isinstance(gate, QuadrantGate):
-        _draw_quadrant_overlay(ax, gate, linewidth)
+        _draw_quadrant_overlay(ax, gate, linewidth, label_text)
+        return
+
+    # Special handling for ThresholdGate — draw vertical line + shading
+    if isinstance(gate, ThresholdGate):
+        _draw_threshold_overlay(ax, gate, linewidth, label_text)
         return
 
     verts = gate.vertices
     if not verts:
         return
+    display_label = label_text if label_text is not None else gate.name
     poly = MplPolygon(
         verts,
         closed=True,
@@ -155,18 +165,20 @@ def draw_gate_overlay(ax, gate: Gate, linewidth: float = 2.0):
     ax.add_patch(poly)
     # Label near first vertex
     ax.annotate(
-        gate.name,
+        display_label,
         xy=verts[0],
-        fontsize=9,
+        fontsize=8,
         fontweight="bold",
         color=gate.color,
         backgroundcolor="white",
     )
 
 
-def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0):
+def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0,
+                           label_text: str | None = None):
     """Draw crosshair lines and shade the selected quadrant."""
     mx, my = gate.mid_x, gate.mid_y
+    display_label = label_text if label_text is not None else gate.name
 
     # Draw full crosshair in a muted colour
     ax.axvline(mx, color=gate.color, lw=linewidth, ls="--", alpha=0.6)
@@ -191,11 +203,39 @@ def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0):
 
     # Label near the crosshair center
     ax.annotate(
-        gate.name,
+        display_label,
         xy=(mx, my),
         xytext=(5, 5),
         textcoords="offset points",
-        fontsize=9,
+        fontsize=8,
+        fontweight="bold",
+        color=gate.color,
+        backgroundcolor="white",
+    )
+
+
+def _draw_threshold_overlay(ax, gate: ThresholdGate, linewidth: float = 2.0,
+                             label_text: str | None = None):
+    """Draw a vertical threshold line and shade the selected side."""
+    display_label = label_text if label_text is not None else gate.name
+    tx = gate.threshold
+
+    ax.axvline(tx, color=gate.color, lw=linewidth, ls="--", alpha=0.7)
+
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    if gate.side == "left":
+        ax.axvspan(xlim[0], tx, color=gate.color, alpha=0.08)
+    else:
+        ax.axvspan(tx, xlim[1], color=gate.color, alpha=0.08)
+
+    # Label near the threshold line
+    ax.annotate(
+        display_label,
+        xy=(tx, ylim[1] * 0.9 if ylim[1] > 0 else ylim[0] * 0.1),
+        xytext=(5, -10),
+        textcoords="offset points",
+        fontsize=8,
         fontweight="bold",
         color=gate.color,
         backgroundcolor="white",

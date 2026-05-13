@@ -33,6 +33,7 @@ from matplotlib.patches import Rectangle as RectPatch, Polygon as PolyPatch, Ell
 from .reader import FCSData
 from .gating import (
     Gate, GateManager, PolygonGate, RectangleGate, EllipseGate, QuadrantGate,
+    ThresholdGate,
 )
 from .plotting import (
     density_scatter,
@@ -49,7 +50,10 @@ MODE_POLY = "Polygon"
 MODE_RECT = "Rectangle"
 MODE_ELLIPSE = "Ellipse"
 MODE_QUAD = "Quadrant"
-MODE_MOVE = "Move Gate"
+MODE_THRESH = "1D Gate"
+MODE_TRANSLATE = "Translate"
+MODE_ROTATE = "Rotate"
+MODE_STRETCH = "Stretch"
 
 
 class FlowCytApp:
@@ -93,6 +97,28 @@ class FlowCytApp:
 
         # View mode: "2D" (scatter) or "1D" (histogram)
         self._view_mode: str = "2D"
+
+        # 1D axis compression via click-drag
+        # Anchor = data value where user clicked; frac = where it sits on
+        # screen [0,1] after dragging.  None = no compression active.
+        self._compress_anchor: float | None = None
+        self._compress_frac: float | None = None   # display fraction [0,1]
+        self._compress_dmin: float = 0.0
+        self._compress_dmax: float = 1.0
+        self._compress_dragging: bool = False
+        self._compress_drag_px: float = 0.0     # pixel-x at drag start
+        self._compress_base_frac: float = 0.5   # frac at drag start
+
+        # Stretch mode state
+        self._stretch_selected_gate: Gate | None = None
+        self._stretch_points: list[tuple[float, float]] = []
+        self._stretch_point_idx: int = -1
+        self._stretch_point_artists: list = []
+
+        # Undo / redo stacks
+        self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
+        self._max_undo: int = 50
 
         # Guard against reentrant/concurrent refresh (prevents segfault)
         self._refreshing: bool = False
@@ -246,8 +272,20 @@ class FlowCytApp:
         self.btn_viewmode = Button(self.ax_viewmode, "View: 2D Scatter")
         self.btn_viewmode.on_clicked(lambda e: self._toggle_view_mode())
 
+        # --- 1D compression hint (visible only in 1D Navigate mode) ---
+        self.ax_compress_hint = self.fig.add_axes([0.06, 0.30, 0.58, 0.03])
+        self.ax_compress_hint.set_xticks([])
+        self.ax_compress_hint.set_yticks([])
+        self.ax_compress_hint.set_frame_on(False)
+        self._compress_hint_text = self.ax_compress_hint.text(
+            0.5, 0.5, "Navigate mode: click & drag to compress axis  •  double-click to reset",
+            ha="center", va="center", fontsize=7, color="grey",
+            transform=self.ax_compress_hint.transAxes,
+        )
+        self.ax_compress_hint.set_visible(False)
+
         # --- Tool selector + Parent gate selector (side by side) ---
-        radio_h = 0.14                     # height for 6 radio items
+        radio_h = 0.195                    # height for 9 radio items
         y_cur -= 0.015                     # gap
         self.fig.text(right_start, y_cur, "Tool", fontsize=9, fontweight="bold")
         half_w = ctrl_w / 2 - 0.005
@@ -256,7 +294,7 @@ class FlowCytApp:
         self.ax_mode = self.fig.add_axes([right_start, y_cur, half_w, radio_h])
         self.radio_mode = RadioButtons(
             self.ax_mode,
-            [MODE_NAV, MODE_POLY, MODE_RECT, MODE_ELLIPSE, MODE_QUAD, MODE_MOVE],
+            [MODE_NAV, MODE_POLY, MODE_RECT, MODE_ELLIPSE, MODE_QUAD, MODE_THRESH, MODE_TRANSLATE, MODE_ROTATE, MODE_STRETCH],
             active=0,
         )
         self.radio_mode.on_clicked(self._on_mode_change)
@@ -284,6 +322,11 @@ class FlowCytApp:
         self.btn_export.on_clicked(lambda e: self._on_export_csv())
         y_cur -= btn_h + 0.005
 
+        self.ax_btn_rename = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
+        self.btn_rename = Button(self.ax_btn_rename, "Rename Gate...")
+        self.btn_rename.on_clicked(lambda e: self._on_rename_gate())
+        y_cur -= btn_h + 0.005
+
         self.ax_btn_remove = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_remove = Button(self.ax_btn_remove, "Remove Gate...")
         self.btn_remove.on_clicked(lambda e: self._on_remove_gate())
@@ -292,6 +335,11 @@ class FlowCytApp:
         self.ax_btn_clear = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_clear = Button(self.ax_btn_clear, "Clear All Gates")
         self.btn_clear.on_clicked(lambda e: self._on_clear_gates())
+        y_cur -= btn_h + 0.005
+
+        self.ax_btn_save = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
+        self.btn_save = Button(self.ax_btn_save, "Save Plot...")
+        self.btn_save.on_clicked(lambda e: self._on_save_plot())
         y_cur -= 0.015
 
         # --- Message log panel (bottom right) ---
@@ -308,6 +356,10 @@ class FlowCytApp:
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+
+        # Prevent Tk from swallowing Tab for widget-focus traversal so that
+        # our key_press_event handler can use it (Stretch mode).
+        self._disable_tk_tab_traversal(self.fig)
 
         # Channel names cache (populated on file load)
         self._channel_display_names: list[str] = []
@@ -502,6 +554,61 @@ class FlowCytApp:
         popup_fig.canvas.draw()
         popup_fig.show()
 
+    def _show_text_input(self, title: str, prompt: str,
+                         initial: str, callback):
+        """Open a matplotlib popup with a text field + OK button.
+
+        When OK is clicked (or Enter pressed), the popup closes and
+        *callback(new_text)* is called.
+        """
+        from matplotlib.widgets import TextBox
+        popup_fig = plt.figure(title, figsize=(5, 2))
+        popup_fig.clf()
+        popup_fig.text(0.05, 0.85, prompt, fontsize=10, fontweight="bold")
+
+        ax_text = popup_fig.add_axes([0.1, 0.4, 0.6, 0.25])
+        tbox = TextBox(ax_text, "", initial=initial)
+
+        ax_ok = popup_fig.add_axes([0.75, 0.4, 0.2, 0.25])
+        btn_ok = Button(ax_ok, "OK")
+
+        def _submit(text=None):
+            val = tbox.text.strip()
+            if val:
+                plt.close(popup_fig)
+                callback(val)
+
+        btn_ok.on_clicked(lambda e: _submit())
+        tbox.on_submit(_submit)
+        popup_fig.canvas.draw()
+        popup_fig.show()
+
+    def _on_rename_gate(self):
+        """Show popup to select a gate, then a text input to rename it."""
+        if not self.gate_mgr.gates:
+            self._log("No gates to rename")
+            return
+
+        items = [f"{g.name}  ({g.x_channel} vs {g.y_channel})"
+                 for g in self.gate_mgr.gates]
+
+        def on_pick(idx):
+            gate = self.gate_mgr.gates[idx]
+            old_name = gate.name
+
+            def on_rename(new_name):
+                gate.name = new_name
+                self._refresh_plot()
+                self._refresh_gate_windows()
+                self._log(f"Renamed '{old_name}' → '{new_name}'")
+
+            self._show_text_input(
+                "Rename Gate", f"Rename '{old_name}' to:",
+                old_name, on_rename,
+            )
+
+        self._show_popup_list("Select gate to rename", items, -1, on_pick)
+
     def _show_file_popup(self):
         """Show a popup list of all discovered FCS files."""
         if not self._fcs_files:
@@ -587,12 +694,105 @@ class FlowCytApp:
         if self._view_mode == "2D":
             self._view_mode = "1D"
             self.btn_viewmode.label.set_text("View: 1D Histogram")
+            self._update_compress_hint()
             self._log("Switched to 1D histogram view")
+            self._log("  In Navigate mode: click & drag to compress axis")
         else:
             self._view_mode = "2D"
             self.btn_viewmode.label.set_text("View: 2D Scatter")
+            self.ax_compress_hint.set_visible(False)
+            self._reset_compression()
             self._log("Switched to 2D scatter view")
         self._do_refresh_plot()
+
+    def _update_compress_hint(self):
+        """Show/hide the compression hint based on mode."""
+        show = (self._view_mode == "1D" and self._mode == MODE_NAV)
+        self.ax_compress_hint.set_visible(show)
+
+    def _reset_compression(self):
+        """Clear axis compression state."""
+        self._compress_anchor = None
+        self._compress_frac = None
+        self._compress_dragging = False
+
+    # ── Piecewise linear axis compression ──
+
+    @staticmethod
+    def _pw_transform(x: np.ndarray, dmin: float, dmax: float,
+                      anchor: float, frac: float) -> np.ndarray:
+        """Piecewise linear transform mapping [dmin, dmax] → [0, 1].
+
+        *anchor* is a data value; *frac* is where anchor appears on screen
+        (0..1).  Data left of anchor maps to [0, frac], right to [frac, 1].
+        """
+        result = np.empty_like(x, dtype=np.float64)
+        left = x <= anchor
+        a_left = anchor - dmin
+        a_right = dmax - anchor
+        if a_left > 0:
+            result[left] = (x[left] - dmin) / a_left * frac
+        else:
+            result[left] = 0.0
+        if a_right > 0:
+            result[~left] = frac + (x[~left] - anchor) / a_right * (1.0 - frac)
+        else:
+            result[~left] = 1.0
+        return result
+
+    @staticmethod
+    def _pw_inverse(t: float, dmin: float, dmax: float,
+                    anchor: float, frac: float) -> float:
+        """Inverse of _pw_transform: screen fraction → data value."""
+        if frac > 0 and t <= frac:
+            return dmin + t / frac * (anchor - dmin)
+        elif (1.0 - frac) > 0:
+            return anchor + (t - frac) / (1.0 - frac) * (dmax - anchor)
+        return anchor
+
+    @staticmethod
+    def _set_pw_ticks(ax, dmin: float, dmax: float, anchor: float,
+                      frac: float, num_ticks: int = 10):
+        """Set tick labels for a piecewise-transformed axis.
+
+        Picks nice values in data space, transforms to [0,1] for positions,
+        shows original values as labels.
+        """
+        from matplotlib.ticker import FixedLocator, FixedFormatter
+
+        data_range = dmax - dmin
+        if data_range <= 0:
+            return
+
+        raw_ticks = np.linspace(dmin, dmax, num_ticks + 2)
+        magnitude = 10 ** int(np.log10(max(abs(dmax), abs(dmin), 1)))
+        if magnitude >= 10:
+            raw_ticks = np.round(raw_ticks / (magnitude / 10)) * (magnitude / 10)
+        nice_ticks = np.unique(raw_ticks)
+
+        tick_positions = FlowCytApp._pw_transform(
+            nice_ticks, dmin, dmax, anchor, frac
+        )
+
+        def _fmt(v):
+            av = abs(v)
+            if av >= 1e6:
+                return f"{v:.0e}"
+            elif av >= 100:
+                return f"{v:.0f}"
+            elif av >= 1:
+                return f"{v:.1f}"
+            elif av >= 0.01:
+                return f"{v:.2f}"
+            else:
+                return f"{v:.1e}"
+
+        tick_labels = [_fmt(v) for v in nice_ticks]
+        ax.xaxis.set_major_locator(FixedLocator(tick_positions))
+        ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
+        for lbl in ax.get_xticklabels():
+            lbl.set_rotation(30)
+            lbl.set_fontsize(7)
 
     def _cycle_channel(self, axis: str, direction: int):
         """Cycle X or Y channel by direction (+1 or -1)."""
@@ -609,14 +809,11 @@ class FlowCytApp:
         if axis == "x":
             self._x_idx = (self._x_idx + direction) % n
             self._log(f"X: {self._channel_display_names[self._x_idx]}")
+            self._reset_compression()  # compression is channel-specific
         else:
             self._y_idx = (self._y_idx + direction) % n
             self._log(f"Y: {self._channel_display_names[self._y_idx]}")
         self._update_channel_labels()
-        # Keep _refreshing=True and call _do_refresh_plot directly.
-        # This avoids a gap where _refreshing is False between here
-        # and _refresh_plot re-setting it — during which the macOS
-        # Cocoa event loop could trigger a render of stale artists.
         self._do_refresh_plot()
 
     def _on_mode_change(self, label):
@@ -628,17 +825,271 @@ class FlowCytApp:
         self._handle_drag_type = None
         self._handle_drag_start = None
         self._quad_midpoint = None
+        self._stretch_selected_gate = None
+        self._stretch_points = []
+        self._stretch_point_idx = -1
+        self._clear_stretch_highlight()
         self._clear_handles()
         self._clear_temp()
+        self._update_compress_hint()
         modes = {
             MODE_NAV: "Navigate mode - pan/zoom",
             MODE_POLY: "Polygon - click vertices, double-click to close",
             MODE_RECT: "Rectangle - click and drag",
             MODE_ELLIPSE: "Ellipse - click center, drag radius",
             MODE_QUAD: "Quadrant - click to place crosshair, then pick quadrant",
-            MODE_MOVE: "Click a gate to select it, then drag handles to resize/rotate",
+            MODE_THRESH: "1D Gate - switch to 1D view, click to set threshold",
+            MODE_TRANSLATE: "Translate - select gate, arrows move in all 4 directions",
+            MODE_ROTATE: "Rotate - select gate, left/right arrows rotate",
+            MODE_STRETCH: "Stretch - select gate, Tab cycles points, arrows move point",
         }
         self._log(modes.get(label, label))
+
+        # When entering Translate or Rotate mode, show gate picker dropdown
+        if label == MODE_TRANSLATE:
+            self._show_gate_picker("Translate")
+        elif label == MODE_ROTATE:
+            self._show_gate_picker("Rotate")
+        elif label == MODE_STRETCH:
+            self._show_stretch_picker()
+
+    def _get_pw_params(self, x: np.ndarray):
+        """Return (dmin, dmax, anchor, frac) if compression is active, else None."""
+        if self._compress_anchor is None or self._compress_frac is None:
+            return None
+        return (self._compress_dmin, self._compress_dmax,
+                self._compress_anchor, self._compress_frac)
+
+    def _show_gate_picker(self, action: str = "Translate"):
+        """Show a popup to select which gate to translate/rotate."""
+        if not self.gate_mgr.gates:
+            self._log("No gates defined — create a gate first")
+            return
+        _, _, xn, yn = self._current_xy()
+        # Show ALL gates, but highlight ones on current view
+        items = []
+        for g in self.gate_mgr.gates:
+            on_view = (g.x_channel == xn and g.y_channel == yn)
+            marker = "●" if on_view else " "
+            items.append(f"{marker} {g.name}  ({g.x_channel} / {g.y_channel})")
+
+        def on_pick(idx):
+            gate = self.gate_mgr.gates[idx]
+            self._handle_selected_gate = gate
+            self._clear_handles()
+            self._draw_handles(gate)
+            if action == "Translate":
+                self._log(f"Selected '{gate.name}' — arrows translate in all directions")
+            else:
+                self._log(f"Selected '{gate.name}' — left/right arrows rotate")
+            self.fig.canvas.draw_idle()
+
+        self._show_popup_list(f"Select Gate to {action}", items, -1, on_pick)
+
+    # ── Stretch mode helpers ──
+
+    def _show_stretch_picker(self):
+        """Show a popup to select which gate to stretch with Tab/arrows."""
+        if not self.gate_mgr.gates:
+            self._log("No gates defined — create a gate first")
+            return
+        _, _, xn, yn = self._current_xy()
+        items = []
+        for g in self.gate_mgr.gates:
+            if isinstance(g, ThresholdGate):
+                continue  # ThresholdGate has no stretch points
+            on_view = (g.x_channel == xn and g.y_channel == yn)
+            marker = "●" if on_view else " "
+            items.append(f"{marker} {g.name}  ({g.x_channel} / {g.y_channel})")
+
+        stretchable = [g for g in self.gate_mgr.gates
+                       if not isinstance(g, ThresholdGate)]
+        if not stretchable:
+            self._log("No stretchable gates (ThresholdGates cannot be stretched)")
+            return
+
+        def on_pick(idx):
+            gate = stretchable[idx]
+            self._stretch_selected_gate = gate
+            self._stretch_points = self._get_stretch_points(gate)
+            self._stretch_point_idx = 0 if self._stretch_points else -1
+            self._draw_stretch_highlight()
+            n_pts = len(self._stretch_points)
+            self._log(f"Stretch '{gate.name}' — {n_pts} control points. "
+                      f"Tab cycles points, arrows move selected point")
+            self._grab_canvas_focus(self.fig)
+            self.fig.canvas.draw_idle()
+
+        self._show_popup_list("Select Gate to Stretch", items, -1, on_pick)
+
+    @staticmethod
+    def _get_stretch_points(gate: Gate) -> list[tuple[float, float]]:
+        """Return the control/vertex points that can be moved for stretching."""
+        if isinstance(gate, PolygonGate):
+            return list(gate.vertices)
+        elif isinstance(gate, RectangleGate):
+            return [
+                (gate.x_min, gate.y_min), (gate.x_max, gate.y_min),
+                (gate.x_max, gate.y_max), (gate.x_min, gate.y_max),
+            ]
+        elif isinstance(gate, EllipseGate):
+            # Return the 4 axis endpoints (semi-axis tips in rotated frame)
+            cos_a = np.cos(gate.angle)
+            sin_a = np.sin(gate.angle)
+            return [
+                (gate.center_x + gate.semi_x * cos_a,
+                 gate.center_y + gate.semi_x * sin_a),   # +X axis
+                (gate.center_x - gate.semi_x * cos_a,
+                 gate.center_y - gate.semi_x * sin_a),   # -X axis
+                (gate.center_x - gate.semi_y * sin_a,
+                 gate.center_y + gate.semi_y * cos_a),   # +Y axis
+                (gate.center_x + gate.semi_y * sin_a,
+                 gate.center_y - gate.semi_y * cos_a),   # -Y axis
+            ]
+        elif isinstance(gate, QuadrantGate):
+            return [(gate.mid_x, gate.mid_y)]
+        return []
+
+    def _apply_stretch_point(self, gate: Gate, idx: int, dx: float, dy: float):
+        """Move a single control point of a gate."""
+        if isinstance(gate, PolygonGate):
+            vx, vy = gate.vertices[idx]
+            gate.vertices[idx] = (vx + dx, vy + dy)
+        elif isinstance(gate, RectangleGate):
+            # 0=BL, 1=BR, 2=TR, 3=TL
+            if idx == 0:
+                gate.x_min += dx; gate.y_min += dy
+            elif idx == 1:
+                gate.x_max += dx; gate.y_min += dy
+            elif idx == 2:
+                gate.x_max += dx; gate.y_max += dy
+            elif idx == 3:
+                gate.x_min += dx; gate.y_max += dy
+        elif isinstance(gate, EllipseGate):
+            # Adjust semi-axis length based on which axis endpoint moved
+            cos_a = np.cos(gate.angle)
+            sin_a = np.sin(gate.angle)
+            # Project dx,dy onto the axis direction
+            if idx in (0, 1):
+                # X-axis endpoints: project onto axis direction
+                proj = dx * cos_a + dy * sin_a
+                sign = 1 if idx == 0 else -1
+                gate.semi_x = max(0.01, gate.semi_x + sign * proj)
+            else:
+                # Y-axis endpoints: project onto perpendicular direction
+                proj = -dx * sin_a + dy * cos_a
+                sign = 1 if idx == 2 else -1
+                gate.semi_y = max(0.01, gate.semi_y + sign * proj)
+        elif isinstance(gate, QuadrantGate):
+            gate.mid_x += dx; gate.mid_y += dy
+        # Update the cached stretch points
+        self._stretch_points = self._get_stretch_points(gate)
+
+    def _draw_stretch_highlight(self):
+        """Draw a highlighted marker on the currently selected stretch point."""
+        self._clear_stretch_highlight()
+        if (self._stretch_selected_gate is None or
+                self._stretch_point_idx < 0 or
+                self._stretch_point_idx >= len(self._stretch_points)):
+            return
+        # Draw all points as small dots, selected point as large ring
+        for i, (px, py) in enumerate(self._stretch_points):
+            if i == self._stretch_point_idx:
+                marker = self.ax_main.plot(
+                    px, py, "o", color="#ff4400", markersize=12,
+                    markeredgecolor="black", markeredgewidth=2,
+                    markerfacecolor="none", zorder=101,
+                )[0]
+            else:
+                marker = self.ax_main.plot(
+                    px, py, "o", color="#888888", markersize=6,
+                    markeredgecolor="black", markeredgewidth=1,
+                    zorder=100,
+                )[0]
+            self._stretch_point_artists.append(marker)
+
+    def _clear_stretch_highlight(self):
+        for a in getattr(self, '_stretch_point_artists', []):
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self._stretch_point_artists = []
+
+    # ── Undo / redo helpers ──
+
+    def _snapshot_gates(self) -> dict:
+        """Capture current gate state + open gate windows for undo."""
+        import copy
+        gate_copies = []
+        for g in self.gate_mgr.gates:
+            gate_copies.append(copy.deepcopy(g))
+        open_windows = list(self._gate_windows.keys())
+        return {"gates": gate_copies, "open_windows": open_windows}
+
+    def _push_undo(self):
+        """Save current state to undo stack (call BEFORE making changes)."""
+        snapshot = self._snapshot_gates()
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._max_undo:
+            self._undo_stack = self._undo_stack[-self._max_undo:]
+        # Any new action clears redo
+        self._redo_stack.clear()
+
+    def _undo(self):
+        if not self._undo_stack:
+            self._log("Nothing to undo")
+            return
+        # Save current state to redo stack
+        self._redo_stack.append(self._snapshot_gates())
+        snapshot = self._undo_stack.pop()
+        self._restore_snapshot(snapshot)
+        self._log("Undo")
+
+    def _redo(self):
+        if not self._redo_stack:
+            self._log("Nothing to redo")
+            return
+        self._undo_stack.append(self._snapshot_gates())
+        snapshot = self._redo_stack.pop()
+        self._restore_snapshot(snapshot)
+        self._log("Redo")
+
+    def _restore_snapshot(self, snapshot: dict):
+        """Restore gate state from a snapshot."""
+        self.gate_mgr.gates = snapshot["gates"]
+        # Reopen any windows that were open in the snapshot but are now closed
+        prev_windows = set(snapshot.get("open_windows", []))
+        current_windows = set(self._gate_windows.keys())
+        # Close windows that weren't open in the snapshot
+        for uid in current_windows - prev_windows:
+            gw = self._gate_windows.get(uid)
+            if gw:
+                try:
+                    plt.close(gw.fig)
+                except Exception:
+                    pass
+                del self._gate_windows[uid]
+        # Reopen windows that were open in snapshot but currently closed
+        for uid in prev_windows - current_windows:
+            gate = next((g for g in self.gate_mgr.gates if g.uid == uid), None)
+            if gate:
+                self._open_gate_window(gate)
+        # Clear any selection state
+        self._handle_selected_gate = None
+        self._stretch_selected_gate = None
+        self._stretch_points = []
+        self._stretch_point_idx = -1
+        self._clear_handles()
+        self._clear_stretch_highlight()
+        self._clear_temp()
+        self._refresh_plot()
+        # Refresh any open gate windows
+        for uid, gw in self._gate_windows.items():
+            try:
+                gw._refresh()
+            except Exception:
+                pass
 
     # ================================================================ #
     #  Plotting
@@ -728,22 +1179,42 @@ class FlowCytApp:
             if self._view_mode == "1D":
                 # ── 1D histogram view ──
                 self.ax_main.clear()
-                if len(x) > 0:
+                pw = self._get_pw_params(x)  # (dmin,dmax,anchor,frac) or None
+                if pw is not None and len(x) > 0:
+                    dmin, dmax, anchor, frac = pw
+                    x_t = self._pw_transform(x, dmin, dmax, anchor, frac)
+                    self.ax_main.hist(
+                        x_t, bins=256, color="steelblue", edgecolor="none",
+                        alpha=0.7, density=True, label="All events",
+                    )
+                    self._set_pw_ticks(self.ax_main, dmin, dmax, anchor, frac)
+                    self.ax_main.set_xlim(-0.02, 1.02)
+                    # Draw anchor marker
+                    anchor_t = self._pw_transform(
+                        np.array([anchor]), dmin, dmax, anchor, frac
+                    )[0]
+                    self.ax_main.axvline(anchor_t, color="red", lw=1,
+                                        ls=":", alpha=0.5)
+                    self.ax_main.set_xlabel(f"{x_label}  (compressed)")
+                elif len(x) > 0:
                     self.ax_main.hist(
                         x, bins=256, color="steelblue", edgecolor="none",
                         alpha=0.7, density=True, label="All events",
                     )
-                self.ax_main.set_xlabel(x_label)
+                    self.ax_main.set_xlabel(x_label)
+                else:
+                    self.ax_main.set_xlabel(x_label)
                 self.ax_main.set_ylabel("Density")
                 self.ax_main.set_title(f"1D Histogram — {x_label}")
 
-                if self._x_scale == "log":
-                    self.ax_main.set_xscale("symlog", linthresh=self._compute_linthresh(x))
-                else:
-                    self.ax_main.set_xscale("linear")
+                if pw is None:
+                    if self._x_scale == "log":
+                        self.ax_main.set_xscale("symlog", linthresh=self._compute_linthresh(x))
+                    else:
+                        self.ax_main.set_xscale("linear")
 
                 # Draw gate ranges as vertical shaded spans
-                self._draw_1d_gate_overlays(xn, yn, x, y)
+                self._draw_1d_gate_overlays(xn, yn, x, y, pw_params=pw)
             else:
                 # ── 2D scatter view ──
                 density_scatter(self.ax_main, x, y)
@@ -761,6 +1232,12 @@ class FlowCytApp:
                 else:
                     self.ax_main.set_yscale("linear")
 
+                # Compute stats for gate labels
+                _stats = self.gate_mgr.compute_stats(
+                    self.fcs.data, self.fcs.channel_names
+                )
+                _stats_by_uid = {s["uid"]: s for s in _stats}
+
                 # Draw gates on the current channel pair
                 parent_on_view = False
                 if self._selected_parent_uid:
@@ -771,12 +1248,18 @@ class FlowCytApp:
 
                 for gate in self.gate_mgr.gates:
                     if gate.x_channel == xn and gate.y_channel == yn:
+                        # Build label: name (pct_total% | pct_parent%)
+                        s = _stats_by_uid.get(gate.uid)
+                        if s:
+                            lbl = f"{gate.name}\n{s['percent_of_total']:.1f}% total | {s['percent']:.1f}% parent"
+                        else:
+                            lbl = gate.name
                         if parent_on_view:
                             if (gate.uid == self._selected_parent_uid
                                     or gate.parent_gate_uid == self._selected_parent_uid):
-                                draw_gate_overlay(self.ax_main, gate)
+                                draw_gate_overlay(self.ax_main, gate, label_text=lbl)
                         else:
-                            draw_gate_overlay(self.ax_main, gate)
+                            draw_gate_overlay(self.ax_main, gate, label_text=lbl)
 
             self.ax_main.set_navigate(True)
             self._refresh_stats()
@@ -889,27 +1372,82 @@ class FlowCytApp:
         )
 
     def _draw_1d_gate_overlays(self, xn: str, yn: str,
-                               x: np.ndarray, y: np.ndarray):
+                               x: np.ndarray, y: np.ndarray,
+                               pw_params: tuple | None = None):
         """In 1D histogram mode, overlay per-gate histograms and
-        show vertical spans for the X-range of each gate."""
+        show vertical spans for the X-range of each gate.
+
+        If *pw_params* = (dmin, dmax, anchor, frac) is given, data and gate
+        positions are displayed in piecewise-transformed space.
+        """
+        stats = self.gate_mgr.compute_stats(
+            self.fcs.data, self.fcs.channel_names
+        ) if self.fcs else []
+        stats_by_uid = {s["uid"]: s for s in stats}
+
         for gate in self.gate_mgr.gates:
-            if gate.x_channel != xn or gate.y_channel != yn:
-                continue
+            # ThresholdGate matches on x_channel only; 2D gates need both
+            if isinstance(gate, ThresholdGate):
+                if gate.x_channel != xn:
+                    continue
+            else:
+                if gate.x_channel != xn or gate.y_channel != yn:
+                    continue
             mask = gate.contains(x, y)
             gated_x = x[mask]
             if len(gated_x) == 0:
                 continue
-            # Overlay the gated histogram
-            self.ax_main.hist(
-                gated_x, bins=256, color=gate.color,
-                edgecolor="none", alpha=0.4, density=True,
-                label=gate.name,
-            )
-            # Vertical span showing gate X range
-            xmin_g, xmax_g = float(gated_x.min()), float(gated_x.max())
-            self.ax_main.axvspan(
-                xmin_g, xmax_g, color=gate.color, alpha=0.08,
-            )
+
+            # Build label with percentages
+            s = stats_by_uid.get(gate.uid)
+            if s:
+                lbl = f"{gate.name} ({s['percent_of_total']:.1f}%|{s['percent']:.1f}%)"
+            else:
+                lbl = gate.name
+
+            if isinstance(gate, ThresholdGate):
+                if pw_params is not None:
+                    dmin, dmax, anchor, frac = pw_params
+                    t_pos = self._pw_transform(
+                        np.array([gate.threshold]), dmin, dmax, anchor, frac
+                    )[0]
+                    xlim = self.ax_main.get_xlim()
+                    self.ax_main.axvline(t_pos, color=gate.color, lw=2,
+                                        ls="--", alpha=0.7)
+                    if gate.side == "left":
+                        self.ax_main.axvspan(xlim[0], t_pos,
+                                             color=gate.color, alpha=0.08)
+                    else:
+                        self.ax_main.axvspan(t_pos, xlim[1],
+                                             color=gate.color, alpha=0.08)
+                    ylim = self.ax_main.get_ylim()
+                    self.ax_main.annotate(
+                        lbl, xy=(t_pos, ylim[1] * 0.9 if ylim[1] > 0 else 0),
+                        xytext=(5, -10), textcoords="offset points",
+                        fontsize=8, fontweight="bold", color=gate.color,
+                        backgroundcolor="white",
+                    )
+                else:
+                    from .plotting import _draw_threshold_overlay
+                    _draw_threshold_overlay(self.ax_main, gate, label_text=lbl)
+            else:
+                # Overlay the gated histogram
+                if pw_params is not None:
+                    dmin, dmax, anchor, frac = pw_params
+                    gated_x_t = self._pw_transform(
+                        gated_x, dmin, dmax, anchor, frac
+                    )
+                else:
+                    gated_x_t = gated_x
+                self.ax_main.hist(
+                    gated_x_t, bins=256, color=gate.color,
+                    edgecolor="none", alpha=0.4, density=True,
+                    label=lbl,
+                )
+                xmin_g, xmax_g = float(gated_x_t.min()), float(gated_x_t.max())
+                self.ax_main.axvspan(
+                    xmin_g, xmax_g, color=gate.color, alpha=0.08,
+                )
         if self.gate_mgr.gates:
             self.ax_main.legend(fontsize=7, loc="upper right")
 
@@ -927,10 +1465,34 @@ class FlowCytApp:
     def _on_click(self, event):
         if self._refreshing:
             return
+
+        # Click outside plot area → switch to Navigate (Task #34)
+        if (event.inaxes != self.ax_main and self.fcs is not None
+                and self._mode not in (MODE_NAV,)):
+            # Only auto-switch for action modes, not if clicking on controls
+            if event.inaxes is None:  # clicked outside any axes
+                self._mode = MODE_NAV
+                self.radio_mode.set_active(0)
+                self._log("Switched to Navigate (clicked outside plot)")
+                return
+
         if event.inaxes != self.ax_main or self.fcs is None:
             return
         if event.xdata is None or event.ydata is None:
             return
+
+        # ── Navigate + 1D: axis compression drag ──
+        if self._mode == MODE_NAV and self._view_mode == "1D" and event.button == 1:
+            if event.dblclick:
+                # Double-click resets compression
+                self._reset_compression()
+                self._refreshing = True
+                self._do_refresh_plot()
+                self._log("Axis compression reset")
+                return
+            self._start_compress_drag(event)
+            return
+
         if self._mode == MODE_POLY:
             self._poly_click(event)
         elif self._mode == MODE_RECT:
@@ -942,16 +1504,24 @@ class FlowCytApp:
         elif self._mode == MODE_QUAD:
             if event.button == 1:
                 self._quad_click(event)
-        elif self._mode == MODE_MOVE:
+        elif self._mode == MODE_THRESH:
+            if event.button == 1:
+                self._thresh_click(event)
+        elif self._mode in (MODE_TRANSLATE, MODE_ROTATE):
             self._move_click(event)
+        elif self._mode == MODE_STRETCH:
+            pass  # Stretch uses Tab + arrows, no click interaction
 
     def _on_release(self, event):
         if self._refreshing:
             return
+        # End compression drag regardless of inaxes
+        if self._compress_dragging:
+            self._compress_dragging = False
+            return
         if event.inaxes != self.ax_main or self.fcs is None:
             return
         if event.xdata is None or event.ydata is None:
-            # Cancel in-progress operations when coords are invalid
             self._rect_origin = None
             self._ellipse_origin = None
             self._handle_drag_type = None
@@ -961,11 +1531,15 @@ class FlowCytApp:
             self._rect_release(event)
         elif self._mode == MODE_ELLIPSE and self._ellipse_origin is not None:
             self._ellipse_release(event)
-        elif self._mode == MODE_MOVE and self._handle_drag_type is not None:
+        elif self._mode in (MODE_TRANSLATE, MODE_ROTATE) and self._handle_drag_type is not None:
             self._move_release(event)
 
     def _on_motion(self, event):
         if self._refreshing:
+            return
+        # Compression drag: use pixel coords, works even outside axes
+        if self._compress_dragging:
+            self._update_compress_drag(event)
             return
         if event.inaxes != self.ax_main or self.fcs is None:
             return
@@ -977,12 +1551,217 @@ class FlowCytApp:
             self._poly_motion(event)
         elif self._mode == MODE_ELLIPSE and self._ellipse_origin is not None:
             self._ellipse_motion(event)
-        elif self._mode == MODE_MOVE and self._handle_drag_type is not None:
+        elif self._mode in (MODE_TRANSLATE, MODE_ROTATE) and self._handle_drag_type is not None:
             self._move_motion(event)
 
+    # ── Compression drag helpers ──
+
+    def _start_compress_drag(self, event):
+        """Begin axis compression drag in 1D Navigate mode."""
+        if self._compress_anchor is not None and self._compress_frac is not None:
+            # Already compressed — click is in [0,1] space, inverse to data
+            anchor_data = self._pw_inverse(
+                event.xdata, self._compress_dmin, self._compress_dmax,
+                self._compress_anchor, self._compress_frac,
+            )
+        else:
+            anchor_data = event.xdata
+
+        xi, _, _, _ = self._current_xy()
+        x_all = self.fcs.data[:, xi]
+        dmin, dmax = float(np.min(x_all)), float(np.max(x_all))
+        if dmax <= dmin:
+            return
+
+        natural_frac = (anchor_data - dmin) / (dmax - dmin)
+        natural_frac = max(0.02, min(0.98, natural_frac))
+
+        self._compress_anchor = anchor_data
+        self._compress_dmin = dmin
+        self._compress_dmax = dmax
+        self._compress_frac = natural_frac
+        self._compress_base_frac = natural_frac
+        self._compress_drag_px = event.x
+        self._compress_dragging = True
+
+    def _update_compress_drag(self, event):
+        """Update compression during drag (pixel coordinates)."""
+        if not self._compress_dragging or event.x is None:
+            return
+        ax_extent = self.ax_main.get_window_extent()
+        ax_width = ax_extent.width
+        if ax_width <= 0:
+            return
+
+        dx_px = event.x - self._compress_drag_px
+        shift = dx_px / ax_width
+        new_frac = self._compress_base_frac + shift
+        new_frac = max(0.02, min(0.98, new_frac))
+        self._compress_frac = new_frac
+
+        self._refreshing = True
+        self._do_refresh_plot()
+
     def _on_key(self, event):
+        # Undo / redo (Ctrl+Z / Ctrl+Shift+Z)
+        if event.key in ("ctrl+z", "cmd+z"):
+            self._undo()
+            return
+        if event.key in ("ctrl+shift+z", "cmd+shift+z", "ctrl+y", "cmd+y"):
+            self._redo()
+            return
+
         if event.key == "enter" and self._mode == MODE_POLY:
             self._close_polygon()
+
+        # Parse arrow direction and shift modifier from key string
+        arrow_keys = {"left", "right", "up", "down",
+                      "shift+left", "shift+right", "shift+up", "shift+down"}
+        direction = event.key.replace("shift+", "") if event.key in arrow_keys else None
+        fine = event.key.startswith("shift+") if event.key in arrow_keys else False
+        scale = 1.0 / 3.0 if fine else 1.0
+
+        # Arrow keys in Translate mode — all 4 directions move the gate
+        if self._mode == MODE_TRANSLATE and self._handle_selected_gate is not None:
+            gate = self._handle_selected_gate
+            if direction in ("left", "right", "up", "down"):
+                self._push_undo()
+                dx, dy = 0.0, 0.0
+                if direction in ("left", "right"):
+                    dx = self._scale_aware_step(
+                        self.ax_main, gate, "x",
+                        self._x_scale, direction == "right",
+                    ) * scale
+                else:
+                    # ThresholdGate only moves horizontally
+                    if isinstance(gate, ThresholdGate):
+                        return
+                    dy = self._scale_aware_step(
+                        self.ax_main, gate, "y",
+                        self._y_scale, direction == "up",
+                    ) * scale
+                self._apply_move(gate, dx, dy)
+                self._clear_handles()
+                self._refresh_plot()
+                self._handle_selected_gate = gate
+                self._draw_handles(gate)
+
+        # Arrow keys in Rotate mode — left/right rotate the gate
+        if self._mode == MODE_ROTATE and self._handle_selected_gate is not None:
+            gate = self._handle_selected_gate
+            if direction in ("left", "right"):
+                if isinstance(gate, (ThresholdGate, QuadrantGate)):
+                    return  # no rotation for these
+                self._push_undo()
+                base_delta = np.radians(2) if direction == "right" else np.radians(-2)
+                delta = base_delta * scale
+                cx, cy = self._gate_centroid(gate)
+                self._apply_rotate(gate, delta, cx, cy)
+                gate = next((g for g in self.gate_mgr.gates if g.uid == gate.uid), gate)
+                self._handle_selected_gate = gate
+                self._clear_handles()
+                self._refresh_plot()
+                self._handle_selected_gate = gate
+                self._draw_handles(gate)
+
+        # Stretch mode: Tab cycles points, arrows move selected point
+        if self._mode == MODE_STRETCH and self._stretch_selected_gate is not None:
+            if event.key == "tab":
+                if not self._stretch_points:
+                    return
+                self._stretch_point_idx = (
+                    (self._stretch_point_idx + 1) % len(self._stretch_points)
+                )
+                self._clear_stretch_highlight()
+                self._draw_stretch_highlight()
+                self._log(f"Control point {self._stretch_point_idx + 1}/"
+                          f"{len(self._stretch_points)}")
+                self.fig.canvas.draw_idle()
+            elif direction in ("left", "right", "up", "down"):
+                if self._stretch_point_idx < 0:
+                    return
+                self._push_undo()
+                gate = self._stretch_selected_gate
+                idx = self._stretch_point_idx
+                dx, dy = 0.0, 0.0
+                if direction in ("left", "right"):
+                    dx = self._scale_aware_step(
+                        self.ax_main, gate, "x",
+                        self._x_scale, direction == "right",
+                    ) * scale
+                else:
+                    dy = self._scale_aware_step(
+                        self.ax_main, gate, "y",
+                        self._y_scale, direction == "up",
+                    ) * scale
+                self._apply_stretch_point(gate, idx, dx, dy)
+                self._clear_stretch_highlight()
+                self._refresh_plot()
+                self._stretch_selected_gate = gate
+                self._draw_stretch_highlight()
+                self.fig.canvas.draw_idle()
+
+    @staticmethod
+    def _disable_tk_tab_traversal(fig):
+        """Prevent Tk from consuming Tab for widget-focus traversal.
+
+        Without this, pressing Tab while the cursor is away from the canvas
+        triggers Tk's focus-cycling instead of reaching matplotlib's
+        key_press_event handler.
+        """
+        try:
+            canvas = fig.canvas
+            tk_canvas = canvas.get_tk_widget()
+            # Bind Tab directly on the canvas so it fires our matplotlib
+            # handler and then returns 'break' to suppress Tk traversal.
+            def _on_tk_tab(tk_event):
+                # Manually fire the matplotlib key_press_event
+                from matplotlib.backend_bases import KeyEvent
+                key_event = KeyEvent("key_press_event", canvas,
+                                     "tab", x=0, y=0)
+                canvas.callbacks.process("key_press_event", key_event)
+                return "break"
+            tk_canvas.bind('<Tab>', _on_tk_tab)
+            # Also bind on the top-level window to catch Tab when focus
+            # is on a radio button or other widget.
+            tk_canvas.winfo_toplevel().bind('<Tab>', _on_tk_tab)
+        except Exception:
+            pass  # Non-TkAgg backend — nothing to do
+
+    @staticmethod
+    def _grab_canvas_focus(fig):
+        """Move keyboard focus to the matplotlib canvas widget."""
+        try:
+            fig.canvas.get_tk_widget().focus_set()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _scale_aware_step(ax, gate, axis: str, scale: str,
+                          positive: bool) -> float:
+        """Compute a movement step that is constant in the displayed scale.
+
+        In log scale the step is multiplicative (constant on a log axis).
+        In linear scale the step is additive (2% of visible range).
+        """
+        if axis == "x":
+            lo, hi = ax.get_xlim()
+        else:
+            lo, hi = ax.get_ylim()
+
+        if scale == "log" and lo > 0 and hi > 0:
+            # Constant step in log10 space → multiplicative in data space
+            cx, cy = FlowCytApp._gate_centroid(gate)
+            pos = cx if axis == "x" else cy
+            if pos <= 0:
+                pos = max(lo, 1e-3)
+            log_range = np.log10(hi) - np.log10(lo)
+            log_step = log_range * 0.02
+            factor = 10 ** (log_step if positive else -log_step)
+            return pos * (factor - 1.0)
+        else:
+            step = (hi - lo) * 0.02
+            return step if positive else -step
 
     # -- Polygon -------------------------------------------------------
     def _poly_motion(self, event):
@@ -1054,6 +1833,7 @@ class FlowCytApp:
         if len(self._poly_verts) < 3:
             self._log("Need >= 3 vertices for polygon")
             return
+        self._push_undo()
         xi, yi, xn, yn = self._current_xy()
         n = len(self.gate_mgr.gates) + 1
         gate = self.gate_mgr.add_polygon_gate(
@@ -1096,6 +1876,7 @@ class FlowCytApp:
         if abs(x1 - x0) < 1e-9 or abs(y1 - y0) < 1e-9:
             return
 
+        self._push_undo()
         xi, yi, xn, yn = self._current_xy()
         n = len(self.gate_mgr.gates) + 1
         gate = self.gate_mgr.add_rectangle_gate(
@@ -1142,6 +1923,7 @@ class FlowCytApp:
         if dx < 1e-9 or dy < 1e-9:
             return
 
+        self._push_undo()
         xi, yi, xn, yn = self._current_xy()
         n = len(self.gate_mgr.gates) + 1
         gate = self.gate_mgr.add_ellipse_gate(
@@ -1199,15 +1981,23 @@ class FlowCytApp:
         if isinstance(gate, RectangleGate):
             return gate.x_min, gate.x_max, gate.y_min, gate.y_max
         elif isinstance(gate, EllipseGate):
-            # Approximate bbox ignoring rotation for handle placement
-            return (gate.center_x - gate.semi_x, gate.center_x + gate.semi_x,
-                    gate.center_y - gate.semi_y, gate.center_y + gate.semi_y)
+            # Compute rotated bounding box
+            cos_a = np.cos(gate.angle)
+            sin_a = np.sin(gate.angle)
+            # Half-widths in x/y after rotation
+            hw = np.sqrt((gate.semi_x * cos_a) ** 2 + (gate.semi_y * sin_a) ** 2)
+            hh = np.sqrt((gate.semi_x * sin_a) ** 2 + (gate.semi_y * cos_a) ** 2)
+            return (gate.center_x - hw, gate.center_x + hw,
+                    gate.center_y - hh, gate.center_y + hh)
         elif isinstance(gate, PolygonGate) and gate.vertices:
             xs = [v[0] for v in gate.vertices]
             ys = [v[1] for v in gate.vertices]
             return min(xs), max(xs), min(ys), max(ys)
         elif isinstance(gate, QuadrantGate):
             return gate.mid_x - 1, gate.mid_x + 1, gate.mid_y - 1, gate.mid_y + 1
+        elif isinstance(gate, ThresholdGate):
+            t = gate.threshold
+            return t, t, 0, 1  # degenerate: single vertical line
         return 0, 1, 0, 1
 
     @staticmethod
@@ -1222,6 +2012,16 @@ class FlowCytApp:
         for gate in self.gate_mgr.gates:
             if gate.x_channel != xn or gate.y_channel != yn:
                 continue
+            if isinstance(gate, ThresholdGate):
+                # Check proximity to threshold line (in pixel space)
+                try:
+                    gate_px = self.ax_main.transData.transform((gate.threshold, 0))[0]
+                    click_px = self.ax_main.transData.transform((px, 0))[0]
+                    if abs(gate_px - click_px) < 15:
+                        candidates.append(gate)
+                except Exception:
+                    pass
+                continue
             if gate.contains(np.array([px]), np.array([py]))[0]:
                 candidates.append(gate)
         if not candidates:
@@ -1229,11 +2029,20 @@ class FlowCytApp:
         candidates.sort(key=lambda g: len(g.vertices) if g.vertices else 1e9)
         return candidates[0]
 
-    def _compute_handles(self, gate: Gate) -> list[tuple[float, float, str]]:
+    def _compute_handles(self, gate: Gate, ax=None) -> list[tuple[float, float, str]]:
         """Compute handle positions in data coordinates.
 
         Returns list of (x, y, handle_type).
         """
+        if ax is None:
+            ax = self.ax_main
+
+        # ThresholdGate: single handle on the threshold line
+        if isinstance(gate, ThresholdGate):
+            ylim = ax.get_ylim()
+            my = (ylim[0] + ylim[1]) / 2
+            return [(gate.threshold, my, "move")]
+
         xmin, xmax, ymin, ymax = self._gate_bbox(gate)
         mx = (xmin + xmax) / 2
         my = (ymin + ymax) / 2
@@ -1244,13 +2053,11 @@ class FlowCytApp:
             (xmin, ymin, "bl"), (mx, ymin, "b"), (xmax, ymin, "br"),
         ]
 
-        if not isinstance(gate, QuadrantGate):
-            # Rotation handle: above top-center, offset in display space
-            # Convert top-center to display, shift up 30px, convert back
+        if not isinstance(gate, (QuadrantGate, ThresholdGate)):
             try:
-                disp_tc = self.ax_main.transData.transform((mx, ymax))
+                disp_tc = ax.transData.transform((mx, ymax))
                 disp_rot = (disp_tc[0], disp_tc[1] + 30)
-                rx, ry = self.ax_main.transData.inverted().transform(disp_rot)
+                rx, ry = ax.transData.inverted().transform(disp_rot)
                 handles.append((rx, ry, "rot"))
             except Exception:
                 handles.append((mx, ymax, "rot"))
@@ -1388,8 +2195,13 @@ class FlowCytApp:
             self._preview_move(gate, dx, dy)
 
         elif dtype == "rot":
-            a0 = np.arctan2(sy - cy, sx - cx)
-            a1 = np.arctan2(event.ydata - cy, event.xdata - cx)
+            # Compute angle in display (pixel) space for correct visual rotation
+            trans = self.ax_main.transData
+            cx_d, cy_d = trans.transform((cx, cy))
+            s_d = trans.transform((sx, sy))
+            e_d = trans.transform((event.xdata, event.ydata))
+            a0 = np.arctan2(s_d[1] - cy_d, s_d[0] - cx_d)
+            a1 = np.arctan2(e_d[1] - cy_d, e_d[0] - cx_d)
             self._preview_rotate(gate, a1 - a0, cx, cy)
 
         else:
@@ -1410,19 +2222,26 @@ class FlowCytApp:
         if event.xdata is None or event.ydata is None:
             return
 
+        self._push_undo()
         sx, sy = self._handle_drag_start
         cx, cy = self._gate_centroid(gate)
 
         if dtype == "move":
             dx, dy = event.xdata - sx, event.ydata - sy
             if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+                self._undo_stack.pop()  # nothing changed, remove undo entry
                 return
             self._apply_move(gate, dx, dy)
             self._log(f"Moved gate '{gate.name}'")
 
         elif dtype == "rot":
-            a0 = np.arctan2(sy - cy, sx - cx)
-            a1 = np.arctan2(event.ydata - cy, event.xdata - cx)
+            # Compute angle in display (pixel) space
+            trans = self.ax_main.transData
+            cx_d, cy_d = trans.transform((cx, cy))
+            s_d = trans.transform((sx, sy))
+            e_d = trans.transform((event.xdata, event.ydata))
+            a0 = np.arctan2(s_d[1] - cy_d, s_d[0] - cx_d)
+            a1 = np.arctan2(e_d[1] - cy_d, e_d[0] - cx_d)
             delta = a1 - a0
             if abs(delta) < 1e-6:
                 return
@@ -1441,7 +2260,9 @@ class FlowCytApp:
 
     # ── Move helpers ──
     def _apply_move(self, gate, dx, dy):
-        if isinstance(gate, PolygonGate):
+        if isinstance(gate, ThresholdGate):
+            gate.threshold += dx  # only horizontal movement
+        elif isinstance(gate, PolygonGate):
             gate.vertices = [(vx + dx, vy + dy) for vx, vy in gate.vertices]
         elif isinstance(gate, RectangleGate):
             gate.x_min += dx; gate.x_max += dx
@@ -1452,7 +2273,11 @@ class FlowCytApp:
             gate.mid_x += dx; gate.mid_y += dy
 
     def _preview_move(self, gate, dx, dy):
-        if isinstance(gate, PolygonGate):
+        if isinstance(gate, ThresholdGate):
+            v = self.ax_main.axvline(gate.threshold + dx, color=gate.color,
+                                     lw=2, ls="--", alpha=0.7)
+            self._temp_artists.append(v)
+        elif isinstance(gate, PolygonGate):
             shifted = [(vx + dx, vy + dy) for vx, vy in gate.vertices]
             p = PolyPatch(shifted, closed=True, fill=False,
                           edgecolor=gate.color, lw=1.5, ls="--")
@@ -1474,43 +2299,120 @@ class FlowCytApp:
             self._temp_artists.extend([v, h])
 
     # ── Rotate helpers ──
-    def _apply_rotate(self, gate, delta, cx, cy):
+    def _apply_rotate(self, gate, delta, cx, cy, ax=None):
+        if ax is None:
+            ax = self.ax_main
         if isinstance(gate, PolygonGate):
-            gate.vertices = [self._rotate_point(vx, vy, cx, cy, delta)
-                             for vx, vy in gate.vertices]
+            # Rotate polygon vertices in display space so it looks correct
+            # even when x and y axes have very different scales.
+            self._rotate_vertices_visual(gate, delta, cx, cy, ax)
         elif isinstance(gate, RectangleGate):
             corners = gate.vertices
-            rotated = [self._rotate_point(vx, vy, cx, cy, delta)
-                       for vx, vy in corners]
+            # Promote to polygon, then rotate in display space
             new_gate = PolygonGate(
                 name=gate.name, x_channel=gate.x_channel,
-                y_channel=gate.y_channel, vertices=rotated,
+                y_channel=gate.y_channel, vertices=list(corners),
                 color=gate.color, uid=gate.uid,
                 parent_gate_uid=gate.parent_gate_uid,
             )
+            self._rotate_vertices_visual(new_gate, delta, cx, cy, ax)
             idx = next((i for i, g in enumerate(self.gate_mgr.gates)
                         if g.uid == gate.uid), None)
             if idx is not None:
                 self.gate_mgr.gates[idx] = new_gate
                 self._handle_selected_gate = new_gate
         elif isinstance(gate, EllipseGate):
-            gate.angle += delta
+            self._rotate_ellipse_visual(gate, delta, ax)
+
+    def _rotate_vertices_visual(self, gate, delta, cx, cy, ax):
+        """Rotate polygon vertices by *delta* radians in display (pixel) space."""
+        trans = ax.transData
+        inv = trans.inverted()
+        cx_d, cy_d = trans.transform((cx, cy))
+        cos_d, sin_d = np.cos(delta), np.sin(delta)
+        new_verts = []
+        for vx, vy in gate.vertices:
+            dx_d, dy_d = trans.transform((vx, vy))
+            rx = dx_d - cx_d
+            ry = dy_d - cy_d
+            nx = cx_d + rx * cos_d - ry * sin_d
+            ny = cy_d + rx * sin_d + ry * cos_d
+            nvx, nvy = inv.transform((nx, ny))
+            new_verts.append((nvx, nvy))
+        gate.vertices = new_verts
+
+    def _rotate_ellipse_visual(self, gate, delta, ax):
+        """Rotate an EllipseGate by *delta* radians in display (pixel) space.
+
+        This converts the semi-axis endpoints to pixel coordinates, rotates
+        them visually, then converts back — so the rotation always looks
+        correct on screen regardless of the axis aspect ratio.
+        """
+        trans = ax.transData
+        inv = trans.inverted()
+
+        # Center in display coords
+        cx_d, cy_d = trans.transform((gate.center_x, gate.center_y))
+
+        # Semi-axis endpoints in data coords
+        cos_a = np.cos(gate.angle)
+        sin_a = np.sin(gate.angle)
+        px_data = (gate.center_x + gate.semi_x * cos_a,
+                   gate.center_y + gate.semi_x * sin_a)
+        py_data = (gate.center_x - gate.semi_y * sin_a,
+                   gate.center_y + gate.semi_y * cos_a)
+
+        # To display coords
+        px_d = trans.transform(px_data)
+        py_d = trans.transform(py_data)
+
+        # Rotate in display space
+        cos_d, sin_d = np.cos(delta), np.sin(delta)
+        def _rot(pt):
+            rx, ry = pt[0] - cx_d, pt[1] - cy_d
+            return (cx_d + rx * cos_d - ry * sin_d,
+                    cy_d + rx * sin_d + ry * cos_d)
+        px_d_rot = _rot(px_d)
+        py_d_rot = _rot(py_d)
+
+        # Back to data coords
+        px_r = inv.transform(px_d_rot)
+        py_r = inv.transform(py_d_rot)
+
+        # Reconstruct semi-axes and angle from rotated endpoints
+        dx_x = px_r[0] - gate.center_x
+        dy_x = px_r[1] - gate.center_y
+        gate.semi_x = max(1e-6, np.sqrt(dx_x ** 2 + dy_x ** 2))
+
+        dx_y = py_r[0] - gate.center_x
+        dy_y = py_r[1] - gate.center_y
+        gate.semi_y = max(1e-6, np.sqrt(dx_y ** 2 + dy_y ** 2))
+
+        gate.angle = np.arctan2(dy_x, dx_x)
 
     def _preview_rotate(self, gate, delta, cx, cy):
-        if isinstance(gate, (PolygonGate, RectangleGate)):
-            verts = gate.vertices
-            rotated = [self._rotate_point(vx, vy, cx, cy, delta)
-                       for vx, vy in verts]
+        # Rotate preview vertices in display space for visual accuracy
+        trans = self.ax_main.transData
+        inv = trans.inverted()
+        cx_d, cy_d = trans.transform((cx, cy))
+        cos_d, sin_d = np.cos(delta), np.sin(delta)
+
+        verts = gate.vertices
+        if verts:
+            rotated = []
+            for vx, vy in verts:
+                dx_d, dy_d = trans.transform((vx, vy))
+                rx, ry = dx_d - cx_d, dy_d - cy_d
+                nx = cx_d + rx * cos_d - ry * sin_d
+                ny = cy_d + rx * sin_d + ry * cos_d
+                nvx, nvy = inv.transform((nx, ny))
+                rotated.append((nvx, nvy))
             p = PolyPatch(rotated, closed=True, fill=False,
                           edgecolor=gate.color, lw=1.5, ls="--")
             self.ax_main.add_patch(p); self._temp_artists.append(p)
-        elif isinstance(gate, EllipseGate):
-            e = EllipsePatch((cx, cy), 2*gate.semi_x, 2*gate.semi_y,
-                             angle=np.degrees(gate.angle + delta),
-                             fill=False, edgecolor=gate.color, lw=1.5, ls="--")
-            self.ax_main.add_patch(e); self._temp_artists.append(e)
-        ln = self.ax_main.plot([cx, cx + (cx-cx)], [cy, cy],  # center dot
-                               "o", color=gate.color, ms=4, alpha=0.5)[0]
+
+        ln = self.ax_main.plot(cx, cy, "o", color=gate.color,
+                               ms=4, alpha=0.5)[0]
         self._temp_artists.append(ln)
 
     # ── Resize helpers ──
@@ -1626,6 +2528,7 @@ class FlowCytApp:
         def on_pick(idx):
             quadrant = ["Q1", "Q2", "Q3", "Q4"][idx]
             self._clear_temp()
+            self._push_undo()
             xi, yi, xn, yn = self._current_xy()
             n = len(self.gate_mgr.gates) + 1
             gate = self.gate_mgr.add_quadrant_gate(
@@ -1642,6 +2545,53 @@ class FlowCytApp:
             self._open_gate_window(gate)
 
         self._show_popup_list("Select Quadrant", options, -1, on_pick)
+
+    def _thresh_click(self, event):
+        """Place a threshold line and choose left/right gating (1D)."""
+        tx_display = event.xdata
+        if self._view_mode != "1D":
+            self._view_mode = "1D"
+            self.btn_viewmode.label.set_text("View: 1D Histogram")
+            self._update_compress_hint()
+            self._refresh_plot()
+
+        # Convert display → original data space when compression active
+        pw = self._get_pw_params(np.array([]))
+        if pw is not None:
+            dmin, dmax, anchor, frac = pw
+            tx = self._pw_inverse(tx_display, dmin, dmax, anchor, frac)
+        else:
+            tx = tx_display
+
+        self._clear_temp()
+        ln = self.ax_main.axvline(tx_display, color="red", lw=2, ls="--", alpha=0.8)
+        self._temp_artists.append(ln)
+        self.fig.canvas.draw_idle()
+
+        options = [
+            f"Left  (x < {tx:.1f})",
+            f"Right (x ≥ {tx:.1f})",
+        ]
+
+        def on_pick(idx):
+            side = "left" if idx == 0 else "right"
+            self._clear_temp()
+            self._push_undo()
+            xi, yi, xn, yn = self._current_xy()
+            n = len(self.gate_mgr.gates) + 1
+            gate = self.gate_mgr.add_threshold_gate(
+                name=f"T{n}-{side[0].upper()}",
+                x_channel=xn,
+                y_channel=yn,
+                threshold=tx,
+                side=side,
+                parent_gate_uid=self._selected_parent_uid,
+            )
+            self._refresh_plot()
+            self._print_gate_created(gate)
+            self._open_gate_window(gate)
+
+        self._show_popup_list("Select side of threshold", options, -1, on_pick)
 
     def _print_gate_created(self, gate):
         logger.debug("Created gate '%s' with parent_gate_uid=%s",
@@ -1688,6 +2638,7 @@ class FlowCytApp:
             items.append(f"{g.name}  ({g.x_channel} vs {g.y_channel}){count_str}{parent_str}")
 
         def on_pick(idx):
+            self._push_undo()
             gate = self.gate_mgr.gates[idx]
             name = gate.name
             uid = gate.uid
@@ -1715,6 +2666,7 @@ class FlowCytApp:
         self._show_popup_list("Remove Gate (click to delete)", items, -1, on_pick)
 
     def _on_clear_gates(self):
+        self._push_undo()
         # Close all gate sub-windows
         for uid in list(self._gate_windows.keys()):
             self._close_gate_window(uid)
@@ -1778,6 +2730,50 @@ class FlowCytApp:
 
         fig.tight_layout()
         plt.show(block=False)
+
+    @staticmethod
+    def _save_axes_to_file(fig, ax, filepath: str, dpi: int = 150):
+        """Save just an axes (with labels, title, ticks) to a file."""
+        # Get the full extent of the axes including tick labels and axis labels
+        renderer = fig.canvas.get_renderer()
+        bbox = ax.get_tightbbox(renderer)
+        if bbox is None:
+            bbox = ax.get_window_extent(renderer)
+        # Convert to inches for savefig
+        bbox_inches = bbox.transformed(fig.dpi_scale_trans.inverted())
+        # Add small padding
+        bbox_inches = bbox_inches.expanded(1.05, 1.05)
+        fig.savefig(filepath, dpi=dpi, bbox_inches=bbox_inches,
+                    facecolor="white", edgecolor="none")
+
+    def _on_save_plot(self):
+        """Save the main plot axes to a PNG file."""
+        if self.fcs is None:
+            self._log("No file loaded")
+            return
+
+        # Build default filename from current file + channels
+        base = Path(self._fcs_files[self._fcs_file_idx]).stem if self._fcs_files and self._fcs_file_idx >= 0 else "plot"
+        xi, yi, xn, yn = self._current_xy()
+        suffix = f"_{xn}_vs_{yn}" if self._view_mode == "2D" else f"_{xn}_1D"
+        # Sanitise channel names for filename
+        safe = lambda s: s.replace("/", "-").replace(" ", "_").replace(":", "-")
+        default_name = f"{safe(base)}{safe(suffix)}.png"
+
+        # Show a save dialog — use popup with text input
+        def on_save(fname):
+            fpath = Path(fname)
+            if not fpath.suffix:
+                fpath = fpath.with_suffix(".png")
+            try:
+                self._save_axes_to_file(self.fig, self.ax_main, str(fpath))
+                self._log(f"Plot saved to {fpath}")
+            except Exception as exc:
+                self._log(f"Save error: {exc}")
+
+        self._show_text_input(
+            "Save Plot", "Save plot as:", default_name, on_save
+        )
 
     def _on_export_csv(self):
         """Export gated events to CSV - saves directly to workspace folder."""
@@ -1984,20 +2980,47 @@ class GateWindow:
 
         # View mode toggle
         self._view_mode = "2D"
+        # 1D axis compression state
+        self._compress_anchor: float | None = None
+        self._compress_frac: float | None = None
+        self._compress_dmin: float = 0.0
+        self._compress_dmax: float = 1.0
+        self._compress_dragging: bool = False
+        self._compress_drag_px: float = 0.0
+        self._compress_base_frac: float = 0.5
         y_cur -= btn_h + 0.005
         ax_vm = self.fig.add_axes([rs, y_cur, cw, btn_h])
         self._btn_vm = Button(ax_vm, "View: 2D Scatter")
         self._btn_vm.on_clicked(lambda e: self._toggle_view())
 
+        # Compression hint (below plot, visible in 1D Navigate)
+        self._ax_compress_hint = self.fig.add_axes([0.08, 0.04, 0.58, 0.03])
+        self._ax_compress_hint.set_xticks([])
+        self._ax_compress_hint.set_yticks([])
+        self._ax_compress_hint.set_frame_on(False)
+        self._ax_compress_hint.text(
+            0.5, 0.5,
+            "Navigate: click & drag to compress  •  double-click to reset",
+            ha="center", va="center", fontsize=6, color="grey",
+            transform=self._ax_compress_hint.transAxes,
+        )
+        self._ax_compress_hint.set_visible(False)
+
+        # Stretch mode state
+        self._stretch_selected_gate: Gate | None = None
+        self._stretch_points: list[tuple[float, float]] = []
+        self._stretch_point_idx: int = -1
+        self._stretch_point_artists: list = []
+
         # --- Tool selector (radio) ---
         y_cur -= 0.01
         self.fig.text(rs, y_cur, "Tool", fontsize=8, fontweight="bold")
-        radio_h = 0.12
+        radio_h = 0.155
         y_cur -= radio_h
         self.ax_mode = self.fig.add_axes([rs, y_cur, cw, radio_h])
         self.radio_mode = RadioButtons(
             self.ax_mode,
-            [MODE_NAV, MODE_POLY, MODE_RECT, MODE_ELLIPSE, MODE_QUAD, MODE_MOVE],
+            [MODE_NAV, MODE_POLY, MODE_RECT, MODE_ELLIPSE, MODE_QUAD, MODE_THRESH, MODE_TRANSLATE, MODE_ROTATE, MODE_STRETCH],
             active=0,
         )
         self.radio_mode.on_clicked(self._on_mode_change)
@@ -2013,6 +3036,11 @@ class GateWindow:
         self._btn_clear = Button(ax_clr, "Clear Child Gates")
         self._btn_clear.on_clicked(lambda e: self._on_clear_child_gates())
 
+        y_cur -= btn_h + 0.005
+        ax_save = self.fig.add_axes([rs, y_cur, cw, btn_h])
+        self._btn_save = Button(ax_save, "Save Plot...")
+        self._btn_save.on_clicked(lambda e: self._on_save_plot())
+
         # Stats panel (fills remaining space)
         y_cur -= 0.01
         stats_h = max(y_cur - 0.03, 0.08)
@@ -2027,6 +3055,8 @@ class GateWindow:
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         self.fig.canvas.mpl_connect("close_event", self._on_close)
+
+        FlowCytApp._disable_tk_tab_traversal(self.fig)
 
         self._update_labels()
         self._refresh()
@@ -2125,10 +3155,28 @@ class GateWindow:
         if self._view_mode == "2D":
             self._view_mode = "1D"
             self._btn_vm.label.set_text("View: 1D Histogram")
+            self._update_gw_compress_hint()
         else:
             self._view_mode = "2D"
             self._btn_vm.label.set_text("View: 2D Scatter")
+            self._ax_compress_hint.set_visible(False)
+            self._reset_gw_compression()
         self._refresh()
+
+    def _update_gw_compress_hint(self):
+        show = (self._view_mode == "1D" and self._mode == MODE_NAV)
+        self._ax_compress_hint.set_visible(show)
+
+    def _reset_gw_compression(self):
+        self._compress_anchor = None
+        self._compress_frac = None
+        self._compress_dragging = False
+
+    def _get_gw_pw_params(self, x):
+        if self._compress_anchor is None or self._compress_frac is None:
+            return None
+        return (self._compress_dmin, self._compress_dmax,
+                self._compress_anchor, self._compress_frac)
 
     def _on_mode_change(self, label):
         self._mode = label
@@ -2138,8 +3186,91 @@ class GateWindow:
         self._handle_selected_gate = None
         self._handle_drag_type = None
         self._handle_drag_start = None
+        self._stretch_selected_gate = None
+        self._stretch_points = []
+        self._stretch_point_idx = -1
+        self._clear_gw_stretch_highlight()
         self._clear_handles()
         self._clear_temp()
+        self._update_gw_compress_hint()
+
+        # Show gate picker when entering Translate/Rotate mode
+        if label == MODE_TRANSLATE:
+            self._show_gw_gate_picker("Translate")
+        elif label == MODE_ROTATE:
+            self._show_gw_gate_picker("Rotate")
+        elif label == MODE_STRETCH:
+            self._show_gw_stretch_picker()
+
+    def _show_gw_gate_picker(self, action: str = "Translate"):
+        """Show a popup to select which child gate to translate/rotate."""
+        child_gates = [g for g in self.app.gate_mgr.gates
+                       if g.parent_gate_uid == self.gate.uid]
+        if not child_gates:
+            return
+        items = [f"{g.name}  ({g.x_channel}/{g.y_channel})" for g in child_gates]
+
+        def on_pick(idx):
+            gate = child_gates[idx]
+            self._handle_selected_gate = gate
+            self._clear_handles()
+            self._draw_handles(gate)
+            self.fig.canvas.draw_idle()
+
+        self.app._show_popup_list(f"Select Gate to {action}", items, -1, on_pick)
+
+    def _show_gw_stretch_picker(self):
+        """Show a popup to select which child gate to stretch."""
+        child_gates = [g for g in self.app.gate_mgr.gates
+                       if g.parent_gate_uid == self.gate.uid
+                       and not isinstance(g, ThresholdGate)]
+        if not child_gates:
+            self.app._log(f"[{self.gate.name}] No stretchable child gates")
+            return
+        items = [f"{g.name}  ({g.x_channel}/{g.y_channel})" for g in child_gates]
+
+        def on_pick(idx):
+            gate = child_gates[idx]
+            self._stretch_selected_gate = gate
+            self._stretch_points = FlowCytApp._get_stretch_points(gate)
+            self._stretch_point_idx = 0 if self._stretch_points else -1
+            self._draw_gw_stretch_highlight()
+            n_pts = len(self._stretch_points)
+            self.app._log(f"[{self.gate.name}] Stretch '{gate.name}' — "
+                          f"{n_pts} points. Tab cycles, arrows move")
+            FlowCytApp._grab_canvas_focus(self.fig)
+            self.fig.canvas.draw_idle()
+
+        self.app._show_popup_list("Select Gate to Stretch", items, -1, on_pick)
+
+    def _draw_gw_stretch_highlight(self):
+        self._clear_gw_stretch_highlight()
+        if (self._stretch_selected_gate is None or
+                self._stretch_point_idx < 0 or
+                self._stretch_point_idx >= len(self._stretch_points)):
+            return
+        for i, (px, py) in enumerate(self._stretch_points):
+            if i == self._stretch_point_idx:
+                marker = self.ax.plot(
+                    px, py, "o", color="#ff4400", markersize=12,
+                    markeredgecolor="black", markeredgewidth=2,
+                    markerfacecolor="none", zorder=101,
+                )[0]
+            else:
+                marker = self.ax.plot(
+                    px, py, "o", color="#888888", markersize=6,
+                    markeredgecolor="black", markeredgewidth=1,
+                    zorder=100,
+                )[0]
+            self._stretch_point_artists.append(marker)
+
+    def _clear_gw_stretch_highlight(self):
+        for a in getattr(self, '_stretch_point_artists', []):
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self._stretch_point_artists = []
 
     def _clear_temp(self):
         for a in self._temp_artists:
@@ -2173,19 +3304,35 @@ class GateWindow:
 
         if self._view_mode == "1D":
             self.ax.clear()
-            if len(x) > 0:
+            pw = self._get_gw_pw_params(x)
+            if pw is not None and len(x) > 0:
+                dmin, dmax, anchor, frac = pw
+                x_t = FlowCytApp._pw_transform(x, dmin, dmax, anchor, frac)
+                self.ax.hist(x_t, bins=256, color="steelblue",
+                             edgecolor="none", alpha=0.7, density=True)
+                FlowCytApp._set_pw_ticks(self.ax, dmin, dmax, anchor, frac)
+                self.ax.set_xlim(-0.02, 1.02)
+                anchor_t = FlowCytApp._pw_transform(
+                    np.array([anchor]), dmin, dmax, anchor, frac
+                )[0]
+                self.ax.axvline(anchor_t, color="red", lw=1, ls=":", alpha=0.5)
+                self.ax.set_xlabel(f"{names[xi]}  (compressed)")
+            elif len(x) > 0:
                 self.ax.hist(x, bins=256, color="steelblue",
                              edgecolor="none", alpha=0.7, density=True)
-            self.ax.set_xlabel(names[xi])
+                self.ax.set_xlabel(names[xi])
+            else:
+                self.ax.set_xlabel(names[xi])
             self.ax.set_ylabel("Density")
             self.ax.set_title(
                 f"Gate: {self.gate.name}  ({mask.sum():,} events) — 1D"
             )
-            if self._x_scale == "log" and len(x) > 0:
-                self.ax.set_xscale("symlog",
-                                   linthresh=FlowCytApp._compute_linthresh(x))
-            else:
-                self.ax.set_xscale("linear")
+            if pw is None:
+                if self._x_scale == "log" and len(x) > 0:
+                    self.ax.set_xscale("symlog",
+                                       linthresh=FlowCytApp._compute_linthresh(x))
+                else:
+                    self.ax.set_xscale("linear")
         else:
             density_scatter(self.ax, x, y)
             self.ax.set_xlabel(names[xi])
@@ -2206,9 +3353,16 @@ class GateWindow:
             # Draw child gate overlays on this window's plot
             xn = fcs.channel_names[xi]
             yn = fcs.channel_names[yi]
+            _stats = self.app.gate_mgr.compute_stats(fcs.data, fcs.channel_names)
+            _sbu = {s["uid"]: s for s in _stats}
             for g in self.app.gate_mgr.gates:
                 if g.parent_gate_uid == self.gate.uid and g.x_channel == xn and g.y_channel == yn:
-                    draw_gate_overlay(self.ax, g)
+                    s = _sbu.get(g.uid)
+                    if s:
+                        lbl = f"{g.name}\n{s['percent_of_total']:.1f}% total | {s['percent']:.1f}% parent"
+                    else:
+                        lbl = g.name
+                    draw_gate_overlay(self.ax, g, label_text=lbl)
 
         # Stats panel
         self.ax_stats.clear()
@@ -2257,10 +3411,29 @@ class GateWindow:
     #  Event dispatchers
     # ================================================================ #
     def _on_click(self, event):
+        # Click outside plot area → switch to Navigate
+        if (event.inaxes != self.ax and self.app.fcs is not None
+                and self._mode not in (MODE_NAV,)):
+            if event.inaxes is None:
+                self._mode = MODE_NAV
+                self.radio_mode.set_active(0)
+                self.app._log(f"[{self.gate.name}] Switched to Navigate")
+                return
+
         if event.inaxes != self.ax or self.app.fcs is None:
             return
         if event.xdata is None or event.ydata is None:
             return
+
+        # Navigate + 1D: compression drag
+        if self._mode == MODE_NAV and self._view_mode == "1D" and event.button == 1:
+            if event.dblclick:
+                self._reset_gw_compression()
+                self._refresh()
+                return
+            self._start_gw_compress_drag(event)
+            return
+
         if self._mode == MODE_POLY:
             self._poly_click(event)
         elif self._mode == MODE_RECT:
@@ -2272,10 +3445,18 @@ class GateWindow:
         elif self._mode == MODE_QUAD:
             if event.button == 1:
                 self._quad_click(event)
-        elif self._mode == MODE_MOVE:
+        elif self._mode == MODE_THRESH:
+            if event.button == 1:
+                self._thresh_click(event)
+        elif self._mode in (MODE_TRANSLATE, MODE_ROTATE):
             self._move_click(event)
+        elif self._mode == MODE_STRETCH:
+            pass  # Stretch uses Tab + arrows
 
     def _on_release(self, event):
+        if self._compress_dragging:
+            self._compress_dragging = False
+            return
         if event.inaxes != self.ax or self.app.fcs is None:
             return
         if event.xdata is None or event.ydata is None:
@@ -2288,10 +3469,13 @@ class GateWindow:
             self._rect_release(event)
         elif self._mode == MODE_ELLIPSE and self._ellipse_origin is not None:
             self._ellipse_release(event)
-        elif self._mode == MODE_MOVE and self._handle_drag_type is not None:
+        elif self._mode in (MODE_TRANSLATE, MODE_ROTATE) and self._handle_drag_type is not None:
             self._move_release(event)
 
     def _on_motion(self, event):
+        if self._compress_dragging:
+            self._update_gw_compress_drag(event)
+            return
         if event.inaxes != self.ax or self.app.fcs is None:
             return
         if event.xdata is None or event.ydata is None:
@@ -2302,12 +3486,159 @@ class GateWindow:
             self._poly_motion(event)
         elif self._mode == MODE_ELLIPSE and self._ellipse_origin is not None:
             self._ellipse_motion(event)
-        elif self._mode == MODE_MOVE and self._handle_drag_type is not None:
+        elif self._mode in (MODE_TRANSLATE, MODE_ROTATE) and self._handle_drag_type is not None:
             self._move_motion(event)
 
+    # ── GateWindow compression drag helpers ──
+
+    def _start_gw_compress_drag(self, event):
+        if self._compress_anchor is not None and self._compress_frac is not None:
+            anchor_data = FlowCytApp._pw_inverse(
+                event.xdata, self._compress_dmin, self._compress_dmax,
+                self._compress_anchor, self._compress_frac,
+            )
+        else:
+            anchor_data = event.xdata
+
+        mask = self._get_mask()
+        fcs = self.app.fcs
+        if fcs is None:
+            return
+        xi = self._x_idx
+        xi = max(0, min(xi, len(fcs.channel_names) - 1))
+        x_all = fcs.data[mask, xi] if mask.sum() > 0 else fcs.data[:, xi]
+        dmin, dmax = float(np.min(x_all)), float(np.max(x_all))
+        if dmax <= dmin:
+            return
+
+        natural_frac = (anchor_data - dmin) / (dmax - dmin)
+        natural_frac = max(0.02, min(0.98, natural_frac))
+
+        self._compress_anchor = anchor_data
+        self._compress_dmin = dmin
+        self._compress_dmax = dmax
+        self._compress_frac = natural_frac
+        self._compress_base_frac = natural_frac
+        self._compress_drag_px = event.x
+        self._compress_dragging = True
+
+    def _update_gw_compress_drag(self, event):
+        if not self._compress_dragging or event.x is None:
+            return
+        ax_extent = self.ax.get_window_extent()
+        ax_width = ax_extent.width
+        if ax_width <= 0:
+            return
+        dx_px = event.x - self._compress_drag_px
+        shift = dx_px / ax_width
+        new_frac = self._compress_base_frac + shift
+        new_frac = max(0.02, min(0.98, new_frac))
+        self._compress_frac = new_frac
+        self._refresh()
+
     def _on_key(self, event):
+        # Undo / redo (delegates to main app)
+        if event.key in ("ctrl+z", "cmd+z"):
+            self.app._undo()
+            self._refresh()
+            return
+        if event.key in ("ctrl+shift+z", "cmd+shift+z", "ctrl+y", "cmd+y"):
+            self.app._redo()
+            self._refresh()
+            return
+
         if event.key == "enter" and self._mode == MODE_POLY:
             self._close_polygon()
+
+        # Parse arrow direction and shift modifier
+        arrow_keys = {"left", "right", "up", "down",
+                      "shift+left", "shift+right", "shift+up", "shift+down"}
+        direction = event.key.replace("shift+", "") if event.key in arrow_keys else None
+        fine = event.key.startswith("shift+") if event.key in arrow_keys else False
+        scale = 1.0 / 3.0 if fine else 1.0
+
+        # Arrow keys in Translate mode — all 4 directions
+        if self._mode == MODE_TRANSLATE and self._handle_selected_gate is not None:
+            gate = self._handle_selected_gate
+            if direction in ("left", "right", "up", "down"):
+                self.app._push_undo()
+                dx, dy = 0.0, 0.0
+                if direction in ("left", "right"):
+                    dx = FlowCytApp._scale_aware_step(
+                        self.ax, gate, "x",
+                        self._x_scale, direction == "right",
+                    ) * scale
+                else:
+                    if isinstance(gate, ThresholdGate):
+                        return
+                    dy = FlowCytApp._scale_aware_step(
+                        self.ax, gate, "y",
+                        self._y_scale, direction == "up",
+                    ) * scale
+                self.app._apply_move(gate, dx, dy)
+                self._clear_handles()
+                self._refresh()
+                self.app._refresh_plot()
+                self._handle_selected_gate = gate
+                self._draw_handles(gate)
+
+        # Arrow keys in Rotate mode — left/right rotate
+        if self._mode == MODE_ROTATE and self._handle_selected_gate is not None:
+            gate = self._handle_selected_gate
+            if direction in ("left", "right"):
+                if isinstance(gate, (ThresholdGate, QuadrantGate)):
+                    return
+                self.app._push_undo()
+                base_delta = np.radians(2) if direction == "right" else np.radians(-2)
+                delta = base_delta * scale
+                cx, cy = FlowCytApp._gate_centroid(gate)
+                self.app._apply_rotate(gate, delta, cx, cy, ax=self.ax)
+                gate = next((g for g in self.app.gate_mgr.gates if g.uid == gate.uid), gate)
+                self._handle_selected_gate = gate
+                self._clear_handles()
+                self._refresh()
+                self.app._refresh_plot()
+                self._handle_selected_gate = gate
+                self._draw_handles(gate)
+
+        # Stretch mode: Tab cycles points, arrows move selected point
+        if self._mode == MODE_STRETCH and self._stretch_selected_gate is not None:
+            if event.key == "tab":
+                if not self._stretch_points:
+                    return
+                self._stretch_point_idx = (
+                    (self._stretch_point_idx + 1) % len(self._stretch_points)
+                )
+                self._clear_gw_stretch_highlight()
+                self._draw_gw_stretch_highlight()
+                self.app._log(f"[{self.gate.name}] Control point "
+                              f"{self._stretch_point_idx + 1}/{len(self._stretch_points)}")
+                self.fig.canvas.draw_idle()
+            elif direction in ("left", "right", "up", "down"):
+                if self._stretch_point_idx < 0:
+                    return
+                self.app._push_undo()
+                gate = self._stretch_selected_gate
+                idx = self._stretch_point_idx
+                dx, dy = 0.0, 0.0
+                if direction in ("left", "right"):
+                    dx = FlowCytApp._scale_aware_step(
+                        self.ax, gate, "x",
+                        self._x_scale, direction == "right",
+                    ) * scale
+                else:
+                    dy = FlowCytApp._scale_aware_step(
+                        self.ax, gate, "y",
+                        self._y_scale, direction == "up",
+                    ) * scale
+                self.app._apply_stretch_point(gate, idx, dx, dy)
+                self._stretch_points = FlowCytApp._get_stretch_points(gate)
+                self._clear_gw_stretch_highlight()
+                self._refresh()
+                self.app._refresh_plot()
+                self._stretch_selected_gate = gate
+                self._draw_gw_stretch_highlight()
+                self.fig.canvas.draw_idle()
 
     # ================================================================ #
     #  Gating tools
@@ -2491,6 +3822,51 @@ class GateWindow:
 
         self.app._show_popup_list("Select Quadrant", options, -1, on_pick)
 
+    def _thresh_click(self, event):
+        """Place a threshold line and choose left/right gating (1D)."""
+        tx_display = event.xdata
+        if self._view_mode != "1D":
+            self._view_mode = "1D"
+            self._btn_vm.label.set_text("View: 1D Histogram")
+            self._update_gw_compress_hint()
+            self._refresh()
+
+        # Convert display → original space when compression active
+        pw = self._get_gw_pw_params(np.array([]))
+        if pw is not None:
+            dmin, dmax, anchor, frac = pw
+            tx = FlowCytApp._pw_inverse(tx_display, dmin, dmax, anchor, frac)
+        else:
+            tx = tx_display
+
+        self._clear_temp()
+        ln = self.ax.axvline(tx_display, color="red", lw=2, ls="--", alpha=0.8)
+        self._temp_artists.append(ln)
+        self.fig.canvas.draw_idle()
+
+        options = [
+            f"Left  (x < {tx:.1f})",
+            f"Right (x ≥ {tx:.1f})",
+        ]
+
+        def on_pick(idx):
+            side = "left" if idx == 0 else "right"
+            self._clear_temp()
+            xi, yi, xn, yn = self._current_xy()
+            n = len(self.app.gate_mgr.gates) + 1
+            gate = self.app.gate_mgr.add_threshold_gate(
+                name=f"T{n}-{side[0].upper()}",
+                x_channel=xn, y_channel=yn,
+                threshold=tx, side=side,
+                parent_gate_uid=self.gate.uid,
+            )
+            self._refresh()
+            self.app._refresh_plot()
+            self._log_gate_created(gate)
+            self._open_child_window(gate)
+
+        self.app._show_popup_list("Select side of threshold", options, -1, on_pick)
+
     def _log_gate_created(self, gate):
         """Log creation of a child gate with stats."""
         fcs = self.app.fcs
@@ -2640,8 +4016,13 @@ class GateWindow:
             dx, dy = event.xdata - sx, event.ydata - sy
             self._gw_preview_move(gate, dx, dy)
         elif dtype == "rot":
-            a0 = np.arctan2(sy - cy, sx - cx)
-            a1 = np.arctan2(event.ydata - cy, event.xdata - cx)
+            # Compute angle in display (pixel) space for correct visual rotation
+            trans = self.ax.transData
+            cx_d, cy_d = trans.transform((cx, cy))
+            s_d = trans.transform((sx, sy))
+            e_d = trans.transform((event.xdata, event.ydata))
+            a0 = np.arctan2(s_d[1] - cy_d, s_d[0] - cx_d)
+            a1 = np.arctan2(e_d[1] - cy_d, e_d[0] - cx_d)
             self._gw_preview_rotate(gate, a1 - a0, cx, cy)
         else:
             self._gw_preview_resize(gate, dtype, event.xdata, event.ydata)
@@ -2665,13 +4046,18 @@ class GateWindow:
             self.app._apply_move(gate, dx, dy)
             self.app._log(f"[{self.gate.name}] Moved '{gate.name}'")
         elif dtype == "rot":
-            a0 = np.arctan2(sy - cy, sx - cx)
-            a1 = np.arctan2(event.ydata - cy, event.xdata - cx)
+            # Compute angle in display (pixel) space
+            trans = self.ax.transData
+            cx_d, cy_d = trans.transform((cx, cy))
+            s_d = trans.transform((sx, sy))
+            e_d = trans.transform((event.xdata, event.ydata))
+            a0 = np.arctan2(s_d[1] - cy_d, s_d[0] - cx_d)
+            a1 = np.arctan2(e_d[1] - cy_d, e_d[0] - cx_d)
             delta = a1 - a0
             if abs(delta) < 1e-6:
                 return
             # _apply_rotate needs gate_mgr for rect→poly conversion
-            self.app._apply_rotate(gate, delta, cx, cy)
+            self.app._apply_rotate(gate, delta, cx, cy, ax=self.ax)
             # If rect was converted to polygon, update our reference
             gate = next((g for g in self.app.gate_mgr.gates if g.uid == gate.uid), gate)
             self.app._log(f"[{self.gate.name}] Rotated '{gate.name}' by {np.degrees(delta):.1f}°")
@@ -2708,18 +4094,29 @@ class GateWindow:
             self._temp_artists.extend([v, h])
 
     def _gw_preview_rotate(self, gate, delta, cx, cy):
-        if isinstance(gate, (PolygonGate, RectangleGate)):
-            verts = gate.vertices
-            rotated = [FlowCytApp._rotate_point(vx, vy, cx, cy, delta)
-                       for vx, vy in verts]
+        # Rotate preview vertices in display space for visual accuracy
+        trans = self.ax.transData
+        inv = trans.inverted()
+        cx_d, cy_d = trans.transform((cx, cy))
+        cos_d, sin_d = np.cos(delta), np.sin(delta)
+
+        verts = gate.vertices
+        if verts:
+            rotated = []
+            for vx, vy in verts:
+                dx_d, dy_d = trans.transform((vx, vy))
+                rx, ry = dx_d - cx_d, dy_d - cy_d
+                nx = cx_d + rx * cos_d - ry * sin_d
+                ny = cy_d + rx * sin_d + ry * cos_d
+                nvx, nvy = inv.transform((nx, ny))
+                rotated.append((nvx, nvy))
             p = PolyPatch(rotated, closed=True, fill=False,
                           edgecolor=gate.color, lw=1.5, ls="--")
             self.ax.add_patch(p); self._temp_artists.append(p)
-        elif isinstance(gate, EllipseGate):
-            e = EllipsePatch((cx, cy), 2*gate.semi_x, 2*gate.semi_y,
-                             angle=np.degrees(gate.angle + delta),
-                             fill=False, edgecolor=gate.color, lw=1.5, ls="--")
-            self.ax.add_patch(e); self._temp_artists.append(e)
+
+        ln = self.ax.plot(cx, cy, "o", color=gate.color,
+                           ms=4, alpha=0.5)[0]
+        self._temp_artists.append(ln)
 
     def _gw_preview_resize(self, gate, htype, mx, my):
         xmin, xmax, ymin, ymax = FlowCytApp._gate_bbox(gate)
@@ -2785,6 +4182,28 @@ class GateWindow:
     # ================================================================ #
     #  Actions
     # ================================================================ #
+    def _on_save_plot(self):
+        """Save just the data axes of this gate window."""
+        base = self.gate.name.replace("/", "-").replace(" ", "_")
+        xi, yi, xn, yn = self._current_xy()
+        safe = lambda s: s.replace("/", "-").replace(" ", "_").replace(":", "-")
+        suffix = f"_{safe(xn)}_vs_{safe(yn)}" if self._view_mode == "2D" else f"_{safe(xn)}_1D"
+        default_name = f"{safe(base)}{suffix}.png"
+
+        def on_save(fname):
+            fpath = Path(fname)
+            if not fpath.suffix:
+                fpath = fpath.with_suffix(".png")
+            try:
+                FlowCytApp._save_axes_to_file(self.fig, self.ax, str(fpath))
+                self.app._log(f"[{self.gate.name}] Plot saved to {fpath}")
+            except Exception as exc:
+                self.app._log(f"[{self.gate.name}] Save error: {exc}")
+
+        self.app._show_text_input(
+            "Save Plot", "Save plot as:", default_name, on_save
+        )
+
     def _on_remove_gate(self):
         """Remove a child gate created in this window."""
         child_gates = [g for g in self.app.gate_mgr.gates

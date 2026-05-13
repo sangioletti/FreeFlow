@@ -111,6 +111,31 @@ class QuadrantGate(Gate):
 
 
 @dataclass
+class ThresholdGate(Gate):
+    """Gate defined by a threshold on a single channel (1D gating).
+
+    *side* selects which side of the threshold counts as "inside":
+      "left"  → x < threshold
+      "right" → x >= threshold
+    The y_channel is stored for bookkeeping but not used for containment.
+    """
+    threshold: float = 0.0
+    channel: str = ""     # the channel being thresholded (== x_channel)
+    side: str = "right"   # "left" or "right"
+
+    def contains(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        if self.side == "left":
+            return x < self.threshold
+        else:
+            return x >= self.threshold
+
+    @property
+    def vertices(self) -> list[tuple[float, float]]:
+        """Threshold gates don't have polygon vertices."""
+        return []
+
+
+@dataclass
 class EllipseGate(Gate):
     """Gate defined by an ellipse (center + semi-axes + rotation angle)."""
     center_x: float = 0.0
@@ -239,6 +264,28 @@ class GateManager:
             mid_x=mid_x,
             mid_y=mid_y,
             quadrant=quadrant,
+            color=self._next_color(),
+            parent_gate_uid=parent_gate_uid,
+        )
+        self.gates.append(gate)
+        return gate
+
+    def add_threshold_gate(
+        self,
+        name: str,
+        x_channel: str,
+        y_channel: str,
+        threshold: float,
+        side: str = "right",
+        parent_gate_uid: str | None = None,
+    ) -> ThresholdGate:
+        gate = ThresholdGate(
+            name=name,
+            x_channel=x_channel,
+            y_channel=y_channel,
+            threshold=threshold,
+            channel=x_channel,
+            side=side,
             color=self._next_color(),
             parent_gate_uid=parent_gate_uid,
         )
@@ -376,6 +423,7 @@ class GateManager:
                 else:
                     medians[ch] = 0.0
 
+            pct_of_total = 100.0 * count / total if total else 0.0
             results.append(
                 {
                     "name": gate.name,
@@ -383,7 +431,9 @@ class GateManager:
                     "color": gate.color,
                     "count": count,
                     "total": total,
-                    "percent": pct,
+                    "percent": pct,               # % of parent (or total if no parent)
+                    "percent_of_total": pct_of_total,  # always % of all events
+                    "parent_count": parent_count,
                     "medians": medians,
                     "parent_uid": gate.parent_gate_uid,
                 }
