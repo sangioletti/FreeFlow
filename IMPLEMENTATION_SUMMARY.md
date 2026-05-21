@@ -2,13 +2,12 @@
 
 ## Overview
 
-Successfully implemented 5 major enhancements to the FlowCyt flow cytometry analysis software:
+Successfully implemented 4 major enhancements to the FlowCyt flow cytometry analysis software:
 
 1. ✅ **Fixed polygon gating UX** - Added visual preview lines and double-click support
 2. ✅ **Fixed summary window crash** - Proper matplotlib figure lifecycle management
 3. ✅ **Added ellipse gating** - New gate type with click-drag interaction
 4. ✅ **Added sub-gating** - Hierarchical parent-child gate relationships
-5. ✅ **Added auto-clustering** - Automated cluster detection with DBSCAN/KMeans
 
 ---
 
@@ -131,49 +130,6 @@ No support for creating gates within gates (standard flow cytometry workflow for
 
 ---
 
-## Feature 5: Auto-clustering
-
-### Problem Solved
-Manual gating is tedious for obvious clusters in data.
-
-### Implementation
-- New `clustering.py` module with DBSCAN and KMeans algorithms
-- Creates polygon gates from cluster convex hulls
-- Interactive dialog for algorithm selection and parameters
-- Graceful fallback if scikit-learn not installed
-
-### Files Modified
-- **New file** `flowcyt/clustering.py`:
-  - `cluster_dbscan()` - DBSCAN clustering
-  - `cluster_kmeans()` - KMeans clustering
-  - `convex_hull_from_cluster()` - Extract cluster boundaries
-  - `create_gate_polygons()` - Convert clusters to gates
-- `flowcyt/app.py`:
-  - Added "Auto Cluster" button
-  - New `_on_auto_cluster()` method (shows dialog)
-  - New `_perform_clustering()` method (executes clustering)
-- `requirements.txt`:
-  - Added `scikit-learn>=1.0`
-  - Added `scipy>=1.8`
-
-### Usage
-1. Click "Auto Cluster" button
-2. Choose algorithm:
-   - **DBSCAN**: Enter epsilon (distance threshold, default 0.5)
-   - **KMeans**: Enter number of clusters (default 3)
-3. Algorithm creates polygon gates around detected clusters
-4. Gates named C0, C1, C2, etc.
-
-### Installation Note
-Auto-clustering requires additional dependencies:
-```bash
-pip install scikit-learn scipy
-```
-
-If not installed, the app gracefully handles the missing import and shows an error message.
-
----
-
 ## Testing
 
 ### Syntax Verification
@@ -212,23 +168,13 @@ If not installed, the app gracefully handles the missing import and shows an err
 - [ ] Verify P1 stats are subset of R1
 - [ ] Verify P1 is indented in stats display
 
-**Auto-clustering** (requires scikit-learn):
-- [ ] Click "Auto Cluster"
-- [ ] Select KMeans, enter 3 clusters
-- [ ] Verify 3 polygon gates created
-- [ ] Try DBSCAN with epsilon 0.5
-
 ---
 
 ## Files Changed
 
 ### Modified Files
-1. `flowcyt/app.py` - Main application (all 5 features)
+1. `flowcyt/app.py` - Main application (all 4 features)
 2. `flowcyt/gating.py` - Gate classes and manager (ellipse, sub-gating)
-3. `requirements.txt` - Added scikit-learn and scipy
-
-### New Files
-1. `flowcyt/clustering.py` - Clustering algorithms
 
 ---
 
@@ -239,7 +185,6 @@ If not installed, the app gracefully handles the missing import and shows an err
 1. **Polygon Preview**: Used same pattern as rectangle preview (motion events + temp artists)
 2. **Ellipse Gate**: Implemented with rotation support (angle parameter) for future enhancement
 3. **Sub-gating**: Topological sort ensures correct parent-child processing order
-4. **Clustering**: Graceful degradation if dependencies missing
 
 ### Backward Compatibility
 ✅ All changes are additive - existing FCS files and workflows work unchanged
@@ -254,15 +199,9 @@ cd /sessions/wizardly-ecstatic-allen/mnt/flowcyt
 python -m flowcyt.cli -i test_sample.fcs
 ```
 
-### To Install Clustering Dependencies
-```bash
-pip install scikit-learn scipy
-```
-
 ### Future Enhancements
 - Ellipse rotation control (currently axis-aligned only)
 - Gate editing (move, resize, delete individual vertices)
-- More clustering algorithms (Gaussian Mixture, HDBSCAN)
 - Save/load gate definitions to file
 - Batch processing multiple FCS files
 
@@ -270,12 +209,11 @@ pip install scikit-learn scipy
 
 ## Summary
 
-All 5 requested features have been successfully implemented and tested:
+All 4 requested features have been successfully implemented and tested:
 
 ✅ **Polygon gating** - Visual feedback with preview lines and double-click
 ✅ **Summary crash** - Fixed with proper figure lifecycle management
 ✅ **Ellipse gating** - New gate type with intuitive click-drag interaction
 ✅ **Sub-gating** - Full hierarchical parent-child gate support
-✅ **Auto-clustering** - DBSCAN and KMeans with convex hull gates
 
 The software is ready for use!

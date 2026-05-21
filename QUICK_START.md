@@ -58,23 +58,7 @@ python -m flowcyt.cli
 **To go back to root-level gates:**
 - Select "None" in the Parent Gate selector
 
-### 5. **Auto Clustering**
-
-**Requirements:**
-```bash
-pip install scikit-learn scipy
-```
-
-**How to use:**
-1. Click **"Auto Cluster"** button
-2. If dialog appears:
-   - Choose DBSCAN (density-based) or KMeans (partition-based)
-   - Enter parameters (epsilon for DBSCAN, or cluster count for KMeans)
-3. If no dialog (dialog fails):
-   - **Default**: KMeans with 3 clusters runs automatically
-   - Check console for: `[FlowCyt] Created N gates from clustering`
-
-### 6. **Summary Window**
+### 5. **Summary Window**
 
 - Click **"Summary"** button to see:
   - Bar chart of gate populations
@@ -82,7 +66,7 @@ pip install scikit-learn scipy
   - Statistics table
 - **Fixed**: Can now close and reopen without crashing!
 
-### 7. **Open FCS Button**
+### 6. **Open FCS Button**
 
 - Click **"Open FCS"** button
 - If file dialog doesn't appear:
@@ -101,7 +85,6 @@ Watch the console for helpful messages:
   • Polygon: Preview lines + double-click to close
   • Ellipse: Click-drag for elliptical gates
   • Sub-gating: Select parent in 'Parent Gate' before creating child
-  • Auto Cluster: Automatic gate creation (requires scikit-learn)
 ```
 
 ### Sub-gating Messages
@@ -117,23 +100,9 @@ Watch the console for helpful messages:
 [FlowCyt] Gate 'P1' (child of R1): 3,421 events (12.42%)
 ```
 
-### Auto Clustering
-```
-[FlowCyt] Using default: KMeans with 3 clusters
-[FlowCyt] Created 3 gates from clustering
-```
-
 ---
 
 ## Troubleshooting
-
-### "Auto Cluster does nothing"
-**Solution**: Check console messages
-- If you see `[FlowCyt] Clustering requires scikit-learn and scipy`, install dependencies:
-  ```bash
-  pip install scikit-learn scipy
-  ```
-- Otherwise, it should work with default settings (KMeans, 3 clusters)
 
 ### "Open FCS does nothing"
 **Solution**: Check console for auto-loading message
@@ -192,7 +161,6 @@ Watch the console for helpful messages:
 │[Summary] │                                       │
 │[Export]  │                                       │
 │[Open]    │                                       │
-│[AutoClust]                                      │
 └──────────┴──────────────────────────────────────┘
 ```
 
@@ -226,8 +194,7 @@ Watch the console for helpful messages:
 3. In Parent Gate selector, click "R1"
 4. Create polygon P1 for CD4+ cells (child of R1)
 5. Click "Summary" to see distributions
-6. Try "Auto Cluster" to find additional populations
-7. Export CSV when done
+6. Export CSV when done
 ```
 
 Enjoy your enhanced FlowCyt experience!

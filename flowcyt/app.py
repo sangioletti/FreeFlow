@@ -41,6 +41,7 @@ from .plotting import (
     summary_bar_chart,
     summary_histogram,
 )
+from .markers import load_markers, effective_channel_label
 
 # ------------------------------------------------------------------ #
 #  Constants
@@ -127,6 +128,18 @@ class FlowCytApp:
         # Message log
         self._messages: list[str] = []
         self._max_messages: int = 20  # Keep last 20 messages
+
+        # Per-file fluorophore -> protein marker mapping
+        self._marker_map: dict[str, str] = {}
+
+        # DeepSeek chat assistant state
+        self._llm_client = None                # DeepSeekClient | None (lazy)
+        self._chat_window = None               # ChatWindow | None
+        self._markers_window = None            # MarkersWindow | None
+        self._chat_history: list[dict] = []    # OpenAI-format running history
+        self._session_cost_usd: float = 0.0
+        self._session_tokens_in: int = 0
+        self._session_tokens_out: int = 0
 
         self._build_ui()
 
@@ -340,6 +353,19 @@ class FlowCytApp:
         self.ax_btn_save = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_save = Button(self.ax_btn_save, "Save Plot...")
         self.btn_save.on_clicked(lambda e: self._on_save_plot())
+        y_cur -= btn_h + 0.005
+
+        # --- Chat + Markers buttons (side-by-side) ---
+        half_w_chat = ctrl_w / 2 - 0.005
+        self.ax_btn_chat = self.fig.add_axes([button_x, y_cur, half_w_chat, btn_h])
+        self.btn_chat = Button(self.ax_btn_chat, "Chat")
+        self.btn_chat.on_clicked(lambda e: self._on_open_chat())
+
+        self.ax_btn_markers = self.fig.add_axes(
+            [button_x + half_w_chat + 0.01, y_cur, half_w_chat, btn_h]
+        )
+        self.btn_markers = Button(self.ax_btn_markers, "Markers")
+        self.btn_markers.on_clicked(lambda e: self._on_open_markers())
         y_cur -= 0.015
 
         # --- Message log panel (bottom right) ---
@@ -452,6 +478,13 @@ class FlowCytApp:
             self._log(f"Error loading {path}: {exc}")
             return
 
+        # Load per-file marker map (FCS PnS defaults merged with sidecar overrides)
+        try:
+            self._marker_map = load_markers(path, self.fcs)
+        except Exception as exc:
+            logger.warning("Failed to load marker map for %s: %s", path, exc)
+            self._marker_map = {}
+
         num_gates = len(self.gate_mgr.gates)
         self._log(f"Loaded: {os.path.basename(path)}")
         self._log(f"Events: {self.fcs.num_events:,}, Channels: {self.fcs.num_channels}")
@@ -469,8 +502,12 @@ class FlowCytApp:
             self._fcs_file_idx = self._fcs_files.index(abs_path)
         self._update_file_label()
 
-        # Rebuild channel display names
-        self._channel_display_names = self.fcs.display_names()
+        # Rebuild channel display names using the merged marker map so
+        # user overrides show up next to the fluorophore short name.
+        self._channel_display_names = [
+            effective_channel_label(short, self._marker_map)
+            for short in self.fcs.channel_names
+        ]
         new_names = self.fcs.channel_names
 
         # Restore X/Y channel by matching raw name (e.g. "FSC-A")
@@ -489,6 +526,13 @@ class FlowCytApp:
 
         # Refresh all open gate sub-windows so they show data from the new file
         self._refresh_gate_windows()
+
+        # Refresh markers window if open (so it shows the new file's channels)
+        if self._markers_window is not None:
+            try:
+                self._markers_window.refresh()
+            except Exception:
+                logger.exception("Failed to refresh markers window")
 
     def _on_scan_directory(self):
         """Scan parent directory (go up one level) for FCS files."""
@@ -666,11 +710,11 @@ class FlowCytApp:
             return
         x_name = self._channel_display_names[self._x_idx]
         y_name = self._channel_display_names[self._y_idx]
-        # Truncate long names
-        self.btn_xlabel.label.set_text(x_name[:22])
-        self.btn_xlabel.label.set_fontsize(8)
-        self.btn_ylabel.label.set_text(y_name[:22])
-        self.btn_ylabel.label.set_fontsize(8)
+        # Truncate long names — slightly more room for "SHORT (marker)" labels.
+        self.btn_xlabel.label.set_text(x_name[:32])
+        self.btn_xlabel.label.set_fontsize(7)
+        self.btn_ylabel.label.set_text(y_name[:32])
+        self.btn_ylabel.label.set_fontsize(7)
 
     def _toggle_scale(self, axis: str):
         """Toggle axis scale between linear and log."""
@@ -1171,8 +1215,8 @@ class FlowCytApp:
                 x = x[finite_mask]
                 y = y[finite_mask]
 
-            x_label = self.fcs.display_names()[xi]
-            y_label = self.fcs.display_names()[yi]
+            x_label = effective_channel_label(xn, self._marker_map)
+            y_label = effective_channel_label(yn, self._marker_map)
 
             self.ax_main.set_navigate(False)
 
@@ -2877,6 +2921,159 @@ class FlowCytApp:
                 dead.append(uid)
         for uid in dead:
             del self._gate_windows[uid]
+
+    # ================================================================ #
+    #  Public API for the chat assistant / programmatic control
+    # ================================================================ #
+    def refresh_plot(self):
+        """Redraw the main plot.  Safe to call from any context."""
+        # Keep the parent-gate radio in sync after gate-list mutations.
+        self._refresh_parent_selector()
+        self._refresh_plot()
+
+    def _resolve_channel_idx(self, name_or_idx) -> int:
+        """Resolve a fluorophore short name, protein marker, or integer
+        index to a column index in ``self.fcs.data``.
+        """
+        if self.fcs is None:
+            raise ValueError("No FCS file loaded.")
+        if isinstance(name_or_idx, int):
+            return max(0, min(name_or_idx, len(self.fcs.channel_names) - 1))
+        target = str(name_or_idx).strip()
+        if not target:
+            raise ValueError("Channel name is empty.")
+        # 1. Exact fluorophore short-name match.
+        for idx, short in enumerate(self.fcs.channel_names):
+            if short == target:
+                return idx
+        # 2. Exact marker match (case-insensitive).
+        t_lower = target.lower()
+        for short, marker in (self._marker_map or {}).items():
+            if marker and marker.lower() == t_lower and short in self.fcs.channel_names:
+                return self.fcs.channel_names.index(short)
+        # 3. Match against the effective display label.
+        for idx, label in enumerate(self._channel_display_names):
+            if label == target:
+                return idx
+        # 4. Case-insensitive fluorophore.
+        for idx, short in enumerate(self.fcs.channel_names):
+            if short.lower() == t_lower:
+                return idx
+        raise ValueError(f"Channel '{name_or_idx}' not found.")
+
+    def set_x_channel(self, name_or_idx):
+        idx = self._resolve_channel_idx(name_or_idx)
+        self._x_idx = idx
+        self._update_channel_labels()
+        self._refresh_plot()
+        return idx
+
+    def set_y_channel(self, name_or_idx):
+        idx = self._resolve_channel_idx(name_or_idx)
+        self._y_idx = idx
+        self._update_channel_labels()
+        self._refresh_plot()
+        return idx
+
+    def set_parent_gate_by_name(self, name):
+        """Set the parent-gate selection programmatically."""
+        if name in (None, "", "None", "null"):
+            self._selected_parent_uid = None
+        else:
+            g = self.find_gate_by_name(name)
+            if g is None:
+                raise ValueError(f"Gate '{name}' not found.")
+            self._selected_parent_uid = g.uid
+        self._refresh_parent_selector()
+        self._refresh_plot()
+
+    def set_axis_scale(self, axis: str, scale: str):
+        """Set X or Y axis scale ('linear' or 'log')."""
+        axis = axis.lower()
+        scale = scale.lower()
+        if axis not in {"x", "y"} or scale not in {"linear", "log"}:
+            raise ValueError("axis must be x/y and scale linear/log")
+        current = self._x_scale if axis == "x" else self._y_scale
+        if current == scale:
+            return
+        # Re-use the toggle path so labels stay in sync.
+        self._toggle_scale(axis)
+
+    def find_gate_by_name(self, name: str):
+        for g in self.gate_mgr.gates:
+            if g.name == name:
+                return g
+        return None
+
+    def get_channel_range(self, name_or_idx) -> tuple[float, float]:
+        if self.fcs is None:
+            raise ValueError("No FCS file loaded.")
+        idx = self._resolve_channel_idx(name_or_idx)
+        col = self.fcs.data[:, idx]
+        return float(np.min(col)), float(np.max(col))
+
+    def export_csv(self, filepath: str | None = None) -> str:
+        """Programmatic CSV export used by the chat tool. Returns the path."""
+        if self.fcs is None:
+            raise ValueError("No FCS file loaded.")
+        if not self.gate_mgr.gates:
+            raise ValueError("Define at least one gate first.")
+        if filepath is None:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = Path(self.fcs.filepath).stem
+            filepath = str(
+                Path(__file__).parent.parent / f"{base}_gated_{timestamp}.csv"
+            )
+        with open(filepath, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["gate", "event_idx"] + self.fcs.channel_names)
+            for gate in self.gate_mgr.gates:
+                try:
+                    xi = self.fcs.channel_names.index(gate.x_channel)
+                    yi = self.fcs.channel_names.index(gate.y_channel)
+                except ValueError:
+                    continue
+                mask = gate.contains(self.fcs.data[:, xi], self.fcs.data[:, yi])
+                for idx in np.where(mask)[0]:
+                    writer.writerow(
+                        [gate.name, int(idx)] + self.fcs.data[idx].tolist()
+                    )
+        self._log(f"Exported gated events → {os.path.basename(filepath)}")
+        return filepath
+
+    # ================================================================ #
+    #  Chat / Markers windows (opened from the right-panel buttons)
+    # ================================================================ #
+    def _on_open_chat(self):
+        """Open (or focus) the DeepSeek chat assistant window."""
+        from .chat_window import ChatWindow
+        if self._chat_window is not None:
+            try:
+                if plt.fignum_exists(self._chat_window.fig.number):
+                    try:
+                        self._chat_window.fig.canvas.manager.show()
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+        self._chat_window = ChatWindow(self)
+
+    def _on_open_markers(self):
+        """Open (or focus) the fluorophore → marker mapping editor."""
+        from .markers_window import MarkersWindow
+        if self._markers_window is not None:
+            try:
+                if plt.fignum_exists(self._markers_window.fig.number):
+                    try:
+                        self._markers_window.fig.canvas.manager.show()
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+        self._markers_window = MarkersWindow(self)
 
     # ================================================================ #
     #  Run

@@ -13,7 +13,6 @@
   - File loading
   - Gate creation
   - Sub-gating status
-  - Auto-clustering progress
   - Error messages
 - Still prints to console for debugging
 
@@ -36,7 +35,6 @@
 │                                        │  ◯ Ellip         │
 ├────────────────────────────────────────┤                  │
 │    GATE STATISTICS                     │  [Open FCS]      │
-│    R1    10,000  (50.0%)              │  [Auto Cluster]  │
 │      P1   2,000  (20.0%)              │  [Summary]       │
 │    E1     1,500  (7.5%)               │  [Export CSV]    │
 │                                        │  [Clear Gates]   │
@@ -46,34 +44,6 @@
 │                                        │  Loaded: test... │
 │                                        │  Gate 'R1'...    │
 └────────────────────────────────────────┴──────────────────┘
-```
-
-### ✅ 3. Auto-Clustering Error Handling
-**Before**: Silent failures, no feedback
-**After**: Detailed error messages in GUI message panel
-
-**Error Handling**:
-- Missing dependencies → Clear error message
-- Import errors → Shown in message log
-- Clustering failures → Descriptive error
-- Success → Confirmation message
-
-**Example Messages**:
-```
-Starting auto-clustering...
-Clustering: kmeans with {'n_clusters': 3}
-ERROR: Missing dependencies!
-Install: pip install scikit-learn scipy
-```
-
-Or on success:
-```
-Starting auto-clustering...
-Clustering modules imported OK
-Clustering 25,000 points...
-Found 3 clusters
-Created 3 gate definitions
-SUCCESS: 3 cluster gates created!
 ```
 
 ---
@@ -128,53 +98,7 @@ def _log(self, message: str):
 - File loading messages
 - Gate creation messages
 - Sub-gating status
-- Auto-clustering progress
 - Error messages
-
-### Auto-Clustering Improvements
-
-**Enhanced Error Reporting**:
-```python
-def _perform_clustering(self, algorithm: str, params: dict):
-    self._log(f"Clustering: {algorithm} with {params}")
-
-    try:
-        # Import clustering modules
-        self._log("Clustering modules imported OK")
-    except ImportError as e:
-        self._log("ERROR: Missing dependencies!")
-        self._log("Install: pip install scikit-learn scipy")
-        self._log(f"Details: {e}")
-        return
-
-    # ... clustering code with messages at each step
-
-    self._log(f"SUCCESS: {len(gate_defs)} cluster gates created!")
-```
-
-**User sees progress** in message panel:
-1. Starting...
-2. Importing modules...
-3. Running algorithm...
-4. Found N clusters...
-5. Creating gates...
-6. SUCCESS or ERROR
-
----
-
-## Installation Note
-
-**Auto-clustering requires**:
-```bash
-pip install scikit-learn scipy
-```
-
-**If not installed**, you'll see in the message panel:
-```
-ERROR: Missing dependencies!
-Install: pip install scikit-learn scipy
-Details: No module named 'sklearn'
-```
 
 ---
 
@@ -219,16 +143,6 @@ The message panel (bottom right) shows:
 - All messages also print to console
 - Helps track what the software is doing
 
-### Auto-Clustering
-1. Click "Auto Cluster" button
-2. Watch message panel for progress:
-   - "Starting auto-clustering..."
-   - "Clustering modules imported OK"
-   - "Clustering N points..."
-   - "Found N clusters"
-   - "SUCCESS: N cluster gates created!"
-3. If error appears, follow instructions (usually: install dependencies)
-
 ### Sub-Gating
 1. Create parent gate
 2. Watch message: "Tip: Use 'Parent Gate' for sub-gating"
@@ -240,12 +154,6 @@ The message panel (bottom right) shows:
 ---
 
 ## Troubleshooting
-
-### "Auto-clustering shows error about scikit-learn"
-**Solution**: Install dependencies:
-```bash
-pip install scikit-learn scipy
-```
 
 ### "Message panel is empty"
 - Messages appear when actions are performed
@@ -267,7 +175,6 @@ pip install scikit-learn scipy
 ## Files Changed
 
 1. **flowcyt/app.py** - Complete rewrite with new layout
-2. **flowcyt/app_old.py** - Backup of original (for reference)
 
 ---
 
@@ -309,7 +216,6 @@ No overlap
 ✅ **Message panel** - All feedback visible in GUI
 ✅ **Right-side layout** - More space for data
 ✅ **Better organized** - Logical grouping of controls
-✅ **Auto-clustering errors** - Clear, actionable messages
 ✅ **Professional look** - Clean, modern interface
 
 The new design provides a much better user experience with clear feedback, organized controls, and more space for data visualization!
