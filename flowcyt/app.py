@@ -670,29 +670,54 @@ class FlowCytApp:
 
     def _show_text_input(self, title: str, prompt: str,
                          initial: str, callback):
-        """Open a matplotlib popup with a text field + OK button.
+        """Open a matplotlib popup with a text field + OK / Cancel buttons.
 
-        When OK is clicked (or Enter pressed), the popup closes and
-        *callback(new_text)* is called.
+        OK and Cancel sit *below* the TextBox rather than beside it, so
+        a long typed value (which matplotlib renders overflowing past
+        the right edge of the box) can never visually cover the buttons
+        and lock the user out.  Enter inside the TextBox also submits.
         """
         from ._widgets import TextBox
-        popup_fig = plt.figure(title, figsize=(5, 2))
+        popup_fig = plt.figure(title, figsize=(8.0, 2.4))
         popup_fig.clf()
         popup_fig.text(0.05, 0.85, prompt, fontsize=10, fontweight="bold")
 
-        ax_text = popup_fig.add_axes([0.1, 0.4, 0.6, 0.25])
+        # Wide TextBox spanning ~90% of the popup so most inputs fit
+        # without overflowing in the first place.
+        ax_text = popup_fig.add_axes([0.05, 0.50, 0.90, 0.22])
         tbox = TextBox(ax_text, "", initial=initial)
+        try:
+            tbox.text_disp.set_fontsize(10)
+            # Clip text rendering to the box so an overflowing value can't
+            # paint over surrounding axes.
+            tbox.text_disp.set_clip_on(True)
+        except Exception:
+            pass
 
-        ax_ok = popup_fig.add_axes([0.75, 0.4, 0.2, 0.25])
+        # OK / Cancel BELOW the textbox — overflow above cannot cover them.
+        ax_ok = popup_fig.add_axes([0.28, 0.10, 0.20, 0.22])
         btn_ok = Button(ax_ok, "OK")
+        ax_cancel = popup_fig.add_axes([0.52, 0.10, 0.20, 0.22])
+        btn_cancel = Button(ax_cancel, "Cancel")
 
         def _submit(text=None):
-            val = tbox.text.strip()
-            if val:
+            try:
+                val = (tbox.text or "").strip()
+            except Exception:
+                val = ""
+            if not val:
+                return
+            plt.close(popup_fig)
+            callback(val)
+
+        def _cancel(_e=None):
+            try:
                 plt.close(popup_fig)
-                callback(val)
+            except Exception:
+                pass
 
         btn_ok.on_clicked(lambda e: _submit())
+        btn_cancel.on_clicked(_cancel)
         tbox.on_submit(_submit)
         popup_fig.canvas.draw()
         popup_fig.show()
@@ -3130,15 +3155,41 @@ class FlowCytApp:
                        default_ext: str, title: str = "Save") -> str | None:
         """Open a native Save As dialog and return the chosen path.
 
-        Uses ``tkinter.filedialog`` which renders a real Windows / macOS
-        / GTK system dialog — much more reliable than the matplotlib
-        TextBox popup we used before, which on Windows would silently
-        treat the typed name as a relative path that ended up sitting in
-        an arbitrary working directory or, worse, with no extension.
+        Preference order:
 
-        Returns ``None`` if the user cancels.  Falls back to writing to
-        the user's home directory if Tk isn't usable for any reason.
+        1. **Qt ``QFileDialog``** when the matplotlib backend is Qt-based
+           (the user's setup on macOS).  On macOS this delegates to
+           ``NSSavePanel`` and is the real system Save As dialog —
+           full keyboard support (Cmd+A, Cmd+Shift+←, etc.), correct
+           handling of long filenames, drive letters on Windows, and a
+           proper file-type picker.
+        2. **tkinter ``filedialog``** as a portable fallback for
+           non-Qt backends (TkAgg or otherwise).
+        3. **Home-directory autosave** as the last resort if no GUI
+           toolkit is available at all.
+
+        Returns ``None`` if the user cancels.
         """
+        # 1. Qt QFileDialog — works correctly on Qt backends on every OS.
+        backend = matplotlib.get_backend().lower()
+        if "qt" in backend:
+            try:
+                from matplotlib.backends.qt_compat import QtWidgets
+                # Qt expects filter strings like "PNG image (*.png);;PDF (*.pdf)".
+                filt = ";;".join(f"{name} ({pat})" for name, pat in filetypes)
+                # Reuse the existing QApplication created by the matplotlib
+                # backend rather than constructing a second one.
+                app_qt = QtWidgets.QApplication.instance()
+                if app_qt is None:
+                    app_qt = QtWidgets.QApplication([])
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    None, title, default_name, filt,
+                )
+                return path or None
+            except Exception:
+                pass  # fall through to Tk
+
+        # 2. Tk filedialog — portable fallback.
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -3160,7 +3211,7 @@ class FlowCytApp:
                 pass
             return path or None
         except Exception:
-            # No usable Tk — just dump into the user's home directory.
+            # 3. No usable GUI toolkit — just dump into the user's home dir.
             from pathlib import Path
             return str(Path.home() / default_name)
 
