@@ -29,6 +29,23 @@ logger = logging.getLogger(__name__)
 #  Channel resolution
 # ---------------------------------------------------------------------------- #
 
+def _open_window_for(app, gate) -> None:
+    """Open a dedicated sub-window for *gate*, matching the manual-gating
+    behaviour (which opens a window automatically after each polygon /
+    rectangle / ellipse / quadrant / threshold gate is finalised).
+
+    Failures are swallowed and logged — gate creation should never fail
+    just because the secondary window couldn't open.
+    """
+    opener = getattr(app, "_open_gate_window", None)
+    if opener is None:
+        return
+    try:
+        opener(gate)
+    except Exception:
+        logger.exception("Failed to open sub-window for gate %r", getattr(gate, "name", None))
+
+
 def _resolve_channel(app, name: str) -> tuple[int, str]:
     """Resolve a channel reference (fluorophore or marker name) to (index, short_name).
 
@@ -368,6 +385,20 @@ def build_system_prompt(app) -> str:
         "for gate geometry — call `get_channel_range` first if you need to know",
         "the data scale.",
         "",
+        "AXIS SCALE PROTOCOL — respect the current axis settings, and keep them.",
+        "  * If an axis is currently 'log', the user is reading the data on a",
+        "    logarithmic scale.  Pick gate coordinates that make sense on that",
+        "    scale: a 'CD4 high' or 'positive' population on a log axis typically",
+        "    spans one to two orders of magnitude near the top of the data range,",
+        "    not a narrow linear band.  Use the p99 / median values returned by",
+        "    `get_channel_range` to anchor the boundary in log-space.",
+        "  * Do NOT silently flip an axis from log to linear (or vice versa) just",
+        "    because you are creating a new gate.  Only call `set_axis_scale` if",
+        "    the user explicitly asks for a scale change.  Anything you draw is",
+        "    rendered on the user's currently-selected scale; preserve it.",
+        "  * When the user references the plot they're looking at, assume they",
+        "    mean it as currently scaled (log axes stay log).",
+        "",
         "DESTRUCTIVE ACTIONS PROTOCOL — applies to `remove_gate`,",
         "`clear_all_gates`, and `export_csv`. Both steps are mandatory:",
         "  Step 1. When the user first asks for a destructive action, REPLY",
@@ -489,6 +520,7 @@ def _tool_create_polygon_gate(app, args):
         vertices=verts, parent_gate_uid=parent_uid,
     )
     app.refresh_plot()
+    _open_window_for(app, g)
     return f"Created polygon gate '{g.name}' on {xn} × {yn} with {len(verts)} vertices."
 
 
@@ -503,6 +535,7 @@ def _tool_create_rectangle_gate(app, args):
         parent_gate_uid=parent_uid,
     )
     app.refresh_plot()
+    _open_window_for(app, g)
     return (f"Created rectangle gate '{g.name}' on {xn} × {yn} "
             f"[{g.x_min:.3g}..{g.x_max:.3g}] × [{g.y_min:.3g}..{g.y_max:.3g}].")
 
@@ -519,6 +552,7 @@ def _tool_create_ellipse_gate(app, args):
         parent_gate_uid=parent_uid,
     )
     app.refresh_plot()
+    _open_window_for(app, g)
     return (f"Created ellipse gate '{g.name}' on {xn} × {yn} "
             f"centred at ({g.center_x:.3g}, {g.center_y:.3g}).")
 
@@ -536,6 +570,7 @@ def _tool_create_quadrant_gate(app, args):
         quadrant=quadrant, parent_gate_uid=parent_uid,
     )
     app.refresh_plot()
+    _open_window_for(app, g)
     return f"Created quadrant gate '{g.name}' ({quadrant}) on {xn} × {yn}."
 
 
@@ -556,6 +591,7 @@ def _tool_create_threshold_gate(app, args):
         parent_gate_uid=parent_uid,
     )
     app.refresh_plot()
+    _open_window_for(app, g)
     return f"Created threshold gate '{g.name}' on {xn} at {g.threshold:.3g} ({side})."
 
 

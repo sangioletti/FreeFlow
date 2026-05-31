@@ -12,9 +12,16 @@ Provides:
 from __future__ import annotations
 
 import numpy as np
+import matplotlib.patheffects as path_effects
 from matplotlib.patches import Polygon as MplPolygon
 
 from .gating import Gate, QuadrantGate, ThresholdGate
+
+
+# White outline applied to every gate label so the text stays readable
+# against busy density plots without painting a solid rectangle over the
+# data points underneath.
+_LABEL_OUTLINE = [path_effects.withStroke(linewidth=2.5, foreground="white")]
 
 
 # ------------------------------------------------------------------ #
@@ -134,14 +141,19 @@ def density_scatter(
 # ------------------------------------------------------------------ #
 
 def draw_gate_overlay(ax, gate: Gate, linewidth: float = 2.0,
-                      label_text: str | None = None):
+                      label_text: str | None = None,
+                      quadrant_stats: dict[str, dict] | None = None):
     """Draw the outline of a gate on *ax*.
 
     *label_text* overrides the default label (gate.name).
+    *quadrant_stats* is only meaningful for :class:`QuadrantGate` — when
+    supplied, each quadrant is labelled with its own count + percentage
+    (instead of the single label that previously appeared only on the
+    selected quadrant).
     """
     # Special handling for QuadrantGate — draw crosshair lines
     if isinstance(gate, QuadrantGate):
-        _draw_quadrant_overlay(ax, gate, linewidth, label_text)
+        _draw_quadrant_overlay(ax, gate, linewidth, label_text, quadrant_stats)
         return
 
     # Special handling for ThresholdGate — draw vertical line + shading
@@ -163,28 +175,33 @@ def draw_gate_overlay(ax, gate: Gate, linewidth: float = 2.0,
         label=gate.name,
     )
     ax.add_patch(poly)
-    # Label near first vertex
-    ax.annotate(
+    # Label near first vertex.  The text uses a white-stroke path effect
+    # so it stays legible on dense scatter without a solid background
+    # rectangle hiding the points underneath.
+    txt = ax.annotate(
         display_label,
         xy=verts[0],
         fontsize=8,
         fontweight="bold",
         color=gate.color,
-        backgroundcolor="white",
     )
+    txt.set_path_effects(_LABEL_OUTLINE)
 
 
 def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0,
-                           label_text: str | None = None):
-    """Draw crosshair lines and shade the selected quadrant."""
-    mx, my = gate.mid_x, gate.mid_y
-    display_label = label_text if label_text is not None else gate.name
+                           label_text: str | None = None,
+                           quadrant_stats: dict[str, dict] | None = None):
+    """Draw the crosshair, shade the selected quadrant, and label each
+    quadrant with its count + percentage.
 
-    # Draw full crosshair in a muted colour
+    If ``quadrant_stats`` is omitted, falls back to the legacy
+    single-label-on-the-selected-quadrant behaviour.
+    """
+    mx, my = gate.mid_x, gate.mid_y
+
     ax.axvline(mx, color=gate.color, lw=linewidth, ls="--", alpha=0.6)
     ax.axhline(my, color=gate.color, lw=linewidth, ls="--", alpha=0.6)
 
-    # Shade the selected quadrant lightly
     xlim = ax.get_xlim()
     ylim = ax.get_ylim()
 
@@ -201,17 +218,68 @@ def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0,
             color=gate.color, alpha=0.10,
         )
 
-    # Label near the crosshair center
-    ax.annotate(
-        display_label,
-        xy=(mx, my),
-        xytext=(5, 5),
-        textcoords="offset points",
-        fontsize=8,
-        fontweight="bold",
-        color=gate.color,
-        backgroundcolor="white",
-    )
+    if not quadrant_stats:
+        # Legacy fallback: single label at the crosshair.
+        display_label = label_text if label_text is not None else gate.name
+        txt = ax.annotate(
+            display_label,
+            xy=(mx, my), xytext=(5, 5), textcoords="offset points",
+            fontsize=8, fontweight="bold", color=gate.color,
+        )
+        txt.set_path_effects(_LABEL_OUTLINE)
+        return
+
+    # Per-quadrant labels.  Position each label at a point that mostly
+    # works on both linear and log axes: the midpoint between the
+    # crosshair and the corresponding axis edge in *display* coordinates,
+    # converted back to data.  Falls back to linear midpoints if the
+    # display-coord round-trip fails.
+    corners = {
+        "Q1": (xlim[1], ylim[1]),
+        "Q2": (xlim[0], ylim[1]),
+        "Q3": (xlim[0], ylim[0]),
+        "Q4": (xlim[1], ylim[0]),
+    }
+    halign = {"Q1": "left",  "Q2": "right", "Q3": "right", "Q4": "left"}
+    valign = {"Q1": "top",   "Q2": "top",   "Q3": "bottom", "Q4": "bottom"}
+
+    try:
+        to_display = ax.transData.transform
+        to_data = ax.transData.inverted().transform
+        mid_disp = to_display((mx, my))
+    except Exception:
+        to_display = to_data = None
+        mid_disp = None
+
+    for q, (cx, cy) in corners.items():
+        s = quadrant_stats.get(q)
+        if not s:
+            continue
+        if mid_disp is not None and to_display is not None and to_data is not None:
+            try:
+                corner_disp = to_display((cx, cy))
+                # 60% of the way from the crosshair to the corner reads
+                # cleanly in both linear and log scales.
+                lx = mid_disp[0] + 0.6 * (corner_disp[0] - mid_disp[0])
+                ly = mid_disp[1] + 0.6 * (corner_disp[1] - mid_disp[1])
+                px, py = to_data((lx, ly))
+            except Exception:
+                px = (mx + cx) / 2.0
+                py = (my + cy) / 2.0
+        else:
+            px = (mx + cx) / 2.0
+            py = (my + cy) / 2.0
+
+        is_selected = (q == gate.quadrant)
+        text = f"{q}: {s.get('count', 0):,}  ({s.get('percent', 0.0):.1f}%)"
+        txt = ax.text(
+            px, py, text,
+            ha="center", va="center",
+            fontsize=9 if is_selected else 8,
+            fontweight="bold" if is_selected else "normal",
+            color=gate.color if is_selected else "#333333",
+        )
+        txt.set_path_effects(_LABEL_OUTLINE)
 
 
 def _draw_threshold_overlay(ax, gate: ThresholdGate, linewidth: float = 2.0,
@@ -230,7 +298,7 @@ def _draw_threshold_overlay(ax, gate: ThresholdGate, linewidth: float = 2.0,
         ax.axvspan(tx, xlim[1], color=gate.color, alpha=0.08)
 
     # Label near the threshold line
-    ax.annotate(
+    txt = ax.annotate(
         display_label,
         xy=(tx, ylim[1] * 0.9 if ylim[1] > 0 else ylim[0] * 0.1),
         xytext=(5, -10),
@@ -238,8 +306,8 @@ def _draw_threshold_overlay(ax, gate: ThresholdGate, linewidth: float = 2.0,
         fontsize=8,
         fontweight="bold",
         color=gate.color,
-        backgroundcolor="white",
     )
+    txt.set_path_effects(_LABEL_OUTLINE)
 
 
 # ------------------------------------------------------------------ #

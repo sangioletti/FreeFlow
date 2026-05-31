@@ -18,17 +18,40 @@ logger = logging.getLogger(__name__)
 
 import numpy as np
 import matplotlib
-# Use TkAgg on macOS: the native 'macosx' backend has a Cocoa display-link
-# that fires on a separate thread and can race with artist updates, causing
-# segfaults during interactive refresh (channel switch, gate creation, etc.).
+# Backend selection on macOS.
+#
+# Goal: have normal Magic Trackpad clicks (light or firm) register without
+# needing a Force/deep click, and keep the app responsive.
+#
+# Why not the 'macosx' native backend?  It handles trackpad clicks
+# correctly via Cocoa NSEvent, but it requires a *framework build* of
+# Python (it has to own the main NSApplication thread).  Anaconda's
+# default ``python`` is not a framework build, so the backend tries to
+# re-exec through ``pythonw``/``python3.x`` inside ``python.app`` and
+# fails with "no python 3.x installed" when that helper isn't on PATH.
+#
+# Why not 'TkAgg'?  Tk on macOS swallows light trackpad clicks unless
+# Force Click escalates them, which is exactly the problem we're trying
+# to fix.
+#
+# 'QtAgg' uses Qt's native macOS event handling — it sees light and firm
+# clicks identically, doesn't need framework Python, and ships with most
+# Anaconda installs via PyQt5.  Fall back to macosx (in case the user is
+# on a framework Python) and finally to TkAgg if Qt isn't available.
 if sys.platform == "darwin":
-    try:
-        matplotlib.use("TkAgg")
-    except Exception:
-        pass
+    for _candidate_backend in ("QtAgg", "macosx", "TkAgg"):
+        try:
+            matplotlib.use(_candidate_backend)
+            break
+        except Exception:
+            continue
 import matplotlib.pyplot as plt
-from matplotlib.widgets import RadioButtons, Button
 from matplotlib.patches import Rectangle as RectPatch, Polygon as PolyPatch, Ellipse as EllipsePatch
+
+# Use our macOS-friendly widget variants where a stock matplotlib widget
+# would otherwise need a Force/deep click on macOS trackpads.  On
+# Linux/Windows ``_widgets`` re-exports the stock classes unchanged.
+from ._widgets import Button, RadioButtons, install_tk_click_bridge
 
 from .reader import FCSData
 from .gating import (
@@ -41,7 +64,10 @@ from .plotting import (
     summary_bar_chart,
     summary_histogram,
 )
-from .markers import load_markers, effective_channel_label
+from .markers import (
+    load_markers, load_hidden_channels, effective_channel_label,
+)
+from . import gate_io
 
 # ------------------------------------------------------------------ #
 #  Constants
@@ -115,6 +141,9 @@ class FlowCytApp:
         self._stretch_points: list[tuple[float, float]] = []
         self._stretch_point_idx: int = -1
         self._stretch_point_artists: list = []
+        # Mouse-drag state for stretch mode (in addition to Tab + arrows).
+        self._stretch_dragging: bool = False
+        self._stretch_last_xy: tuple[float, float] | None = None
 
         # Undo / redo stacks
         self._undo_stack: list[dict] = []
@@ -131,6 +160,10 @@ class FlowCytApp:
 
         # Per-file fluorophore -> protein marker mapping
         self._marker_map: dict[str, str] = {}
+        # Per-file set of fluorophore short names the user has hidden from
+        # the channel selectors.  Purely an in-app view filter — doesn't
+        # touch the FCS file.
+        self._hidden_channels: set[str] = set()
 
         # DeepSeek chat assistant state
         self._llm_client = None                # DeepSeekClient | None (lazy)
@@ -222,7 +255,9 @@ class FlowCytApp:
         # RIGHT SIDE: All controls
         right_start = 0.68
         ctrl_w = 0.29       # full width of right panel
-        btn_h = 0.04        # standard button height
+        btn_h = 0.038       # standard button height (compact so all
+                            # buttons + message log fit without overlap)
+        btn_gap = 0.004     # vertical gap between stacked action buttons
         small_btn = 0.05    # width of [<] / [>] arrows
         label_w = ctrl_w - 2 * small_btn  # width of label between arrows
 
@@ -313,7 +348,17 @@ class FlowCytApp:
         self.radio_mode.on_clicked(self._on_mode_change)
 
         self.ax_parent = self.fig.add_axes([right_start + half_w + 0.01, y_cur, half_w, radio_h])
+        # Hide the empty parent-gate panel's default tick marks, labels
+        # and frame so they don't visually leak over the adjacent Tool
+        # radio labels before any gates are created.  ``set_xticks([])``
+        # alone is reset by the autoscaler on the first draw, so we go
+        # through ``xaxis.set_visible(False)`` which suppresses the axis
+        # artists themselves.  ``_refresh_parent_selector`` re-creates
+        # the RadioButtons on top of these axes without re-enabling the
+        # spines.
         self.ax_parent.set_frame_on(False)
+        self.ax_parent.xaxis.set_visible(False)
+        self.ax_parent.yaxis.set_visible(False)
         self._radio_parent = None
 
         # --- Action buttons ---
@@ -323,56 +368,71 @@ class FlowCytApp:
         self.ax_btn_scandir = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_scandir = Button(self.ax_btn_scandir, "Scan Directory...")
         self.btn_scandir.on_clicked(lambda e: self._on_scan_directory())
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
 
         self.ax_btn_summary = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_summary = Button(self.ax_btn_summary, "Summary")
         self.btn_summary.on_clicked(lambda e: self._on_show_summary())
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
 
         self.ax_btn_export = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_export = Button(self.ax_btn_export, "Export CSV")
         self.btn_export.on_clicked(lambda e: self._on_export_csv())
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
 
         self.ax_btn_rename = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_rename = Button(self.ax_btn_rename, "Rename Gate...")
         self.btn_rename.on_clicked(lambda e: self._on_rename_gate())
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
 
         self.ax_btn_remove = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_remove = Button(self.ax_btn_remove, "Remove Gate...")
         self.btn_remove.on_clicked(lambda e: self._on_remove_gate())
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
 
         self.ax_btn_clear = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_clear = Button(self.ax_btn_clear, "Clear All Gates")
         self.btn_clear.on_clicked(lambda e: self._on_clear_gates())
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
 
         self.ax_btn_save = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
         self.btn_save = Button(self.ax_btn_save, "Save Plot...")
         self.btn_save.on_clicked(lambda e: self._on_save_plot())
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
+
+        # --- Save Gates / Load Gates buttons (side-by-side) ---
+        half_w_pair = ctrl_w / 2 - 0.005
+        self.ax_btn_save_gates = self.fig.add_axes([button_x, y_cur, half_w_pair, btn_h])
+        self.btn_save_gates = Button(self.ax_btn_save_gates, "Save Gates")
+        self.btn_save_gates.on_clicked(lambda e: self._on_save_gates())
+
+        self.ax_btn_load_gates = self.fig.add_axes(
+            [button_x + half_w_pair + 0.01, y_cur, half_w_pair, btn_h]
+        )
+        self.btn_load_gates = Button(self.ax_btn_load_gates, "Load Gates")
+        self.btn_load_gates.on_clicked(lambda e: self._on_load_gates())
+        y_cur -= btn_h + btn_gap
 
         # --- Chat + Markers buttons (side-by-side) ---
-        half_w_chat = ctrl_w / 2 - 0.005
-        self.ax_btn_chat = self.fig.add_axes([button_x, y_cur, half_w_chat, btn_h])
+        self.ax_btn_chat = self.fig.add_axes([button_x, y_cur, half_w_pair, btn_h])
         self.btn_chat = Button(self.ax_btn_chat, "Chat")
         self.btn_chat.on_clicked(lambda e: self._on_open_chat())
 
         self.ax_btn_markers = self.fig.add_axes(
-            [button_x + half_w_chat + 0.01, y_cur, half_w_chat, btn_h]
+            [button_x + half_w_pair + 0.01, y_cur, half_w_pair, btn_h]
         )
         self.btn_markers = Button(self.ax_btn_markers, "Markers")
         self.btn_markers.on_clicked(lambda e: self._on_open_markers())
-        y_cur -= 0.015
+        y_cur -= 0.013   # spacing before Message Log
 
         # --- Message log panel (bottom right) ---
         self.fig.text(right_start, y_cur, "Message Log", fontsize=9, fontweight="bold")
-        y_cur -= 0.005
-        msg_h = max(y_cur - 0.03, 0.10)   # fill remaining space down to 0.03
-        self.ax_messages = self.fig.add_axes([right_start, 0.03, ctrl_w, msg_h])
+        y_cur -= 0.008   # gap between the "Message Log" label and its panel
+        # Honest height — do NOT clamp to a minimum, otherwise the panel
+        # extends above its label and overlaps the Chat/Markers buttons.
+        msg_bottom = 0.03
+        msg_h = max(y_cur - msg_bottom, 0.04)
+        self.ax_messages = self.fig.add_axes([right_start, msg_bottom, ctrl_w, msg_h])
         self.ax_messages.set_frame_on(True)
         self.ax_messages.set_xticks([])
         self.ax_messages.set_yticks([])
@@ -386,6 +446,10 @@ class FlowCytApp:
         # Prevent Tk from swallowing Tab for widget-focus traversal so that
         # our key_press_event handler can use it (Stretch mode).
         self._disable_tk_tab_traversal(self.fig)
+
+        # macOS Force-Touch workaround: bind Tk's button events directly so
+        # a normal-pressure click registers without needing a deep press.
+        install_tk_click_bridge(self.fig)
 
         # Channel names cache (populated on file load)
         self._channel_display_names: list[str] = []
@@ -484,6 +548,12 @@ class FlowCytApp:
         except Exception as exc:
             logger.warning("Failed to load marker map for %s: %s", path, exc)
             self._marker_map = {}
+        # Load per-file hidden-channel set (purely a view filter).
+        try:
+            self._hidden_channels = load_hidden_channels(path)
+        except Exception as exc:
+            logger.warning("Failed to load hidden channels for %s: %s", path, exc)
+            self._hidden_channels = set()
 
         num_gates = len(self.gate_mgr.gates)
         self._log(f"Loaded: {os.path.basename(path)}")
@@ -605,7 +675,7 @@ class FlowCytApp:
         When OK is clicked (or Enter pressed), the popup closes and
         *callback(new_text)* is called.
         """
-        from matplotlib.widgets import TextBox
+        from ._widgets import TextBox
         popup_fig = plt.figure(title, figsize=(5, 2))
         popup_fig.clf()
         popup_fig.text(0.05, 0.85, prompt, fontsize=10, fontweight="bold")
@@ -674,28 +744,54 @@ class FlowCytApp:
         )
 
     def _show_channel_popup(self, axis: str):
-        """Show a popup list of all channels for X or Y axis."""
+        """Show a popup list of all channels for X or Y axis.
+
+        Channels the user has hidden via the Markers window are filtered
+        out — but the currently-selected channel is always listed (with
+        a ``"(hidden)"`` annotation) so the user can still navigate away
+        from it.
+        """
         if not self._channel_display_names:
             self._log("No file loaded")
             return
 
         current = self._x_idx if axis == "x" else self._y_idx
+        hidden = self._hidden_channels or set()
+        names = self.fcs.channel_names if self.fcs is not None else []
 
-        def on_pick(idx):
+        # Build the filtered (display_name, real_index) list.
+        visible_pairs: list[tuple[str, int]] = []
+        for i, short in enumerate(names):
+            if short in hidden and i != current:
+                continue
+            label_str = self._channel_display_names[i]
+            if short in hidden and i == current:
+                label_str = f"{label_str}  (hidden)"
+            visible_pairs.append((label_str, i))
+
+        visible_labels = [lbl for lbl, _ in visible_pairs]
+        visible_indices = [idx for _, idx in visible_pairs]
+        try:
+            sel_pos = visible_indices.index(current)
+        except ValueError:
+            sel_pos = -1
+
+        def on_pick(visible_pos):
+            real_idx = visible_indices[visible_pos]
             if axis == "x":
-                self._x_idx = idx
-                self._log(f"X: {self._channel_display_names[idx]}")
+                self._x_idx = real_idx
+                self._log(f"X: {self._channel_display_names[real_idx]}")
             else:
-                self._y_idx = idx
-                self._log(f"Y: {self._channel_display_names[idx]}")
+                self._y_idx = real_idx
+                self._log(f"Y: {self._channel_display_names[real_idx]}")
             self._update_channel_labels()
             self._refresh_plot()
 
         label = "X" if axis == "x" else "Y"
         self._show_popup_list(
             f"Select {label} Channel",
-            self._channel_display_names,
-            current,
+            visible_labels,
+            sel_pos,
             on_pick,
         )
 
@@ -846,17 +942,34 @@ class FlowCytApp:
         n = len(self._channel_display_names)
         if n == 0:
             return
+        # Build the list of visible channel indices, skipping any the
+        # user has hidden via the Markers window.  We always include
+        # the currently-selected one so the user can navigate off it.
+        hidden = self._hidden_channels or set()
+        names = self.fcs.channel_names
+        cur = self._x_idx if axis == "x" else self._y_idx
+        visible = [i for i, s in enumerate(names) if s not in hidden]
+        if cur not in visible:
+            visible.append(cur)
+            visible.sort()
+        if not visible:
+            return
+        try:
+            pos = visible.index(cur)
+        except ValueError:
+            pos = 0
+        new_idx = visible[(pos + direction) % len(visible)]
         # Set _refreshing BEFORE logging so that _refresh_messages
         # does NOT schedule a draw_idle that could race with the
         # upcoming _refresh_plot (which clears and rebuilds axes).
         self._refreshing = True
         if axis == "x":
-            self._x_idx = (self._x_idx + direction) % n
-            self._log(f"X: {self._channel_display_names[self._x_idx]}")
+            self._x_idx = new_idx
+            self._log(f"X: {self._channel_display_names[new_idx]}")
             self._reset_compression()  # compression is channel-specific
         else:
-            self._y_idx = (self._y_idx + direction) % n
-            self._log(f"Y: {self._channel_display_names[self._y_idx]}")
+            self._y_idx = new_idx
+            self._log(f"Y: {self._channel_display_names[new_idx]}")
         self._update_channel_labels()
         self._do_refresh_plot()
 
@@ -1059,6 +1172,99 @@ class FlowCytApp:
             except Exception:
                 pass
         self._stretch_point_artists = []
+
+    # ── Mouse interaction for stretch mode ──
+    # (Tab + arrows still work; the mouse path is an additional convenience.)
+
+    _STRETCH_PICK_PIXELS = 18
+
+    def _stretch_click(self, event):
+        """Pick the nearest stretch point under the cursor and start a drag.
+
+        If no gate is selected yet, fall back to showing the gate picker —
+        matches the keyboard flow that begins by choosing a gate.
+        """
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        if self._stretch_selected_gate is None:
+            self._show_stretch_picker()
+            return
+        if not self._stretch_points:
+            return
+
+        # Pixel-space hit test so the threshold is independent of axis units
+        # (linear vs log vs vastly different ranges on x / y).
+        trans = self.ax_main.transData.transform
+        try:
+            cx, cy = trans((event.xdata, event.ydata))
+        except Exception:
+            return
+        best_idx = -1
+        best_dist = float("inf")
+        for i, (px, py) in enumerate(self._stretch_points):
+            try:
+                pcx, pcy = trans((px, py))
+            except Exception:
+                continue
+            d = ((cx - pcx) ** 2 + (cy - pcy) ** 2) ** 0.5
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        if best_idx < 0 or best_dist > self._STRETCH_PICK_PIXELS:
+            self._log(
+                "Stretch: click closer to a control point "
+                f"(need within {self._STRETCH_PICK_PIXELS} px)."
+            )
+            return
+
+        # Snap selection to this point, then arm the drag.
+        self._stretch_point_idx = best_idx
+        self._clear_stretch_highlight()
+        self._draw_stretch_highlight()
+        self._stretch_dragging = True
+        self._stretch_last_xy = (event.xdata, event.ydata)
+        self._push_undo()
+        self._log(
+            f"Stretch: dragging point {best_idx + 1}/{len(self._stretch_points)}"
+        )
+        self.fig.canvas.draw_idle()
+
+    def _stretch_drag_motion(self, event):
+        """Apply the per-frame delta to the selected stretch point."""
+        if (not self._stretch_dragging
+                or self._stretch_selected_gate is None
+                or self._stretch_point_idx < 0
+                or self._stretch_last_xy is None):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        last_x, last_y = self._stretch_last_xy
+        dx = event.xdata - last_x
+        dy = event.ydata - last_y
+        if dx == 0 and dy == 0:
+            return
+        gate = self._stretch_selected_gate
+        idx = self._stretch_point_idx
+        self._apply_stretch_point(gate, idx, dx, dy)
+        self._stretch_last_xy = (event.xdata, event.ydata)
+        self._clear_stretch_highlight()
+        self._refresh_plot()
+        # _refresh_plot regenerates the artist set; re-attach our selection
+        # so the highlighted marker keeps tracking the dragged point.
+        self._stretch_selected_gate = gate
+        self._draw_stretch_highlight()
+        self.fig.canvas.draw_idle()
+
+    def _stretch_drag_end(self, _event):
+        if not self._stretch_dragging:
+            return
+        gate = self._stretch_selected_gate
+        self._stretch_dragging = False
+        self._stretch_last_xy = None
+        if gate is not None:
+            self._log(f"Stretch: finished editing '{gate.name}'")
 
     # ── Undo / redo helpers ──
 
@@ -1298,12 +1504,19 @@ class FlowCytApp:
                             lbl = f"{gate.name}\n{s['percent_of_total']:.1f}% total | {s['percent']:.1f}% parent"
                         else:
                             lbl = gate.name
+                        # For quadrant gates, pass the per-quadrant
+                        # breakdown so each quadrant gets its own label.
+                        qstats = s.get("quadrant_breakdown") if s else None
                         if parent_on_view:
                             if (gate.uid == self._selected_parent_uid
                                     or gate.parent_gate_uid == self._selected_parent_uid):
-                                draw_gate_overlay(self.ax_main, gate, label_text=lbl)
+                                draw_gate_overlay(self.ax_main, gate,
+                                                  label_text=lbl,
+                                                  quadrant_stats=qstats)
                         else:
-                            draw_gate_overlay(self.ax_main, gate, label_text=lbl)
+                            draw_gate_overlay(self.ax_main, gate,
+                                              label_text=lbl,
+                                              quadrant_stats=qstats)
 
             self.ax_main.set_navigate(True)
             self._refresh_stats()
@@ -1328,6 +1541,15 @@ class FlowCytApp:
                 pass
             self._refreshing = False
             self._in_do_refresh = False
+            # Propagate the refresh to any open gate sub-windows so edits
+            # to a gate's geometry (translate / rotate / stretch / rename
+            # / remove / parent-gate change) are reflected in its child
+            # window immediately. GateWindow._refresh only operates on
+            # its own axes so this can't recurse back into us.
+            try:
+                self._refresh_gate_windows()
+            except Exception:
+                logger.exception("Failed to refresh gate sub-windows")
 
     def _refresh_parent_selector(self):
         """Update parent gate selector with current gates."""
@@ -1408,7 +1630,26 @@ class FlowCytApp:
         lines = []
         for s in stats:
             indent = "  " if s.get("parent_uid") else ""
-            lines.append(f"{indent}{s['name']:6s}  {s['count']:>8,}  ({s['percent']:.1f}%)")
+            name = s["name"]
+            # For quadrant gates, show a header line (the gate's name +
+            # selected quadrant) followed by one indented line per quadrant
+            # so the user sees Q1..Q4 stats at a glance, not just the
+            # selected one.
+            qb = s.get("quadrant_breakdown")
+            if qb:
+                sel = s.get("selected_quadrant", "")
+                lines.append(f"{indent}{name:6s}  (Q-split, sel={sel})")
+                for q in ("Q1", "Q2", "Q3", "Q4"):
+                    qs = qb.get(q) or {}
+                    marker = "*" if q == sel else " "
+                    lines.append(
+                        f"{indent}  {marker}{q}  {qs.get('count', 0):>8,}  "
+                        f"({qs.get('percent', 0.0):.1f}%)"
+                    )
+            else:
+                lines.append(
+                    f"{indent}{name:6s}  {s['count']:>8,}  ({s['percent']:.1f}%)"
+                )
         text = "\n".join(lines)
         self.ax_stats.text(
             0.05, 0.95, text, family="monospace", fontsize=8,
@@ -1465,11 +1706,14 @@ class FlowCytApp:
                         self.ax_main.axvspan(t_pos, xlim[1],
                                              color=gate.color, alpha=0.08)
                     ylim = self.ax_main.get_ylim()
-                    self.ax_main.annotate(
+                    import matplotlib.patheffects as _pe
+                    _ann = self.ax_main.annotate(
                         lbl, xy=(t_pos, ylim[1] * 0.9 if ylim[1] > 0 else 0),
                         xytext=(5, -10), textcoords="offset points",
                         fontsize=8, fontweight="bold", color=gate.color,
-                        backgroundcolor="white",
+                    )
+                    _ann.set_path_effects(
+                        [_pe.withStroke(linewidth=2.5, foreground="white")]
                     )
                 else:
                     from .plotting import _draw_threshold_overlay
@@ -1554,7 +1798,7 @@ class FlowCytApp:
         elif self._mode in (MODE_TRANSLATE, MODE_ROTATE):
             self._move_click(event)
         elif self._mode == MODE_STRETCH:
-            pass  # Stretch uses Tab + arrows, no click interaction
+            self._stretch_click(event)
 
     def _on_release(self, event):
         if self._refreshing:
@@ -1570,6 +1814,8 @@ class FlowCytApp:
             self._ellipse_origin = None
             self._handle_drag_type = None
             self._handle_drag_start = None
+            self._stretch_dragging = False
+            self._stretch_last_xy = None
             return
         if self._mode == MODE_RECT and self._rect_origin is not None:
             self._rect_release(event)
@@ -1577,6 +1823,8 @@ class FlowCytApp:
             self._ellipse_release(event)
         elif self._mode in (MODE_TRANSLATE, MODE_ROTATE) and self._handle_drag_type is not None:
             self._move_release(event)
+        elif self._mode == MODE_STRETCH and self._stretch_dragging:
+            self._stretch_drag_end(event)
 
     def _on_motion(self, event):
         if self._refreshing:
@@ -1597,6 +1845,8 @@ class FlowCytApp:
             self._ellipse_motion(event)
         elif self._mode in (MODE_TRANSLATE, MODE_ROTATE) and self._handle_drag_type is not None:
             self._move_motion(event)
+        elif self._mode == MODE_STRETCH and self._stretch_dragging:
+            self._stretch_drag_motion(event)
 
     # ── Compression drag helpers ──
 
@@ -1727,16 +1977,23 @@ class FlowCytApp:
                 self._push_undo()
                 gate = self._stretch_selected_gate
                 idx = self._stretch_point_idx
+                # Anchor the log-mode step at the point being stretched,
+                # not the gate centroid — otherwise the visible step on a
+                # log axis is wrong for any point that isn't at the centre
+                # of the gate (and that's almost every stretch point).
+                px, py = self._stretch_points[idx]
                 dx, dy = 0.0, 0.0
                 if direction in ("left", "right"):
                     dx = self._scale_aware_step(
                         self.ax_main, gate, "x",
                         self._x_scale, direction == "right",
+                        position=px,
                     ) * scale
                 else:
                     dy = self._scale_aware_step(
                         self.ax_main, gate, "y",
                         self._y_scale, direction == "up",
+                        position=py,
                     ) * scale
                 self._apply_stretch_point(gate, idx, dx, dy)
                 self._clear_stretch_highlight()
@@ -1782,11 +2039,17 @@ class FlowCytApp:
 
     @staticmethod
     def _scale_aware_step(ax, gate, axis: str, scale: str,
-                          positive: bool) -> float:
+                          positive: bool, position: float | None = None) -> float:
         """Compute a movement step that is constant in the displayed scale.
 
-        In log scale the step is multiplicative (constant on a log axis).
-        In linear scale the step is additive (2% of visible range).
+        * Linear axis: 2% of the visible range, returned as ``±dx`` / ``±dy``.
+        * Log axis: a constant step in log10-space → multiplicative in data
+          space.  The step magnitude is anchored at ``position`` when
+          provided (e.g. the actual control point being stretched), so the
+          visible distance the point moves is uniform on a log axis no
+          matter where the point sits.  When ``position`` is ``None`` we
+          fall back to the gate's centroid — the right behaviour for whole-
+          gate moves (translate / rotate) where there's no single point.
         """
         if axis == "x":
             lo, hi = ax.get_xlim()
@@ -1794,15 +2057,17 @@ class FlowCytApp:
             lo, hi = ax.get_ylim()
 
         if scale == "log" and lo > 0 and hi > 0:
-            # Constant step in log10 space → multiplicative in data space
-            cx, cy = FlowCytApp._gate_centroid(gate)
-            pos = cx if axis == "x" else cy
-            if pos <= 0:
-                pos = max(lo, 1e-3)
             log_range = np.log10(hi) - np.log10(lo)
             log_step = log_range * 0.02
             factor = 10 ** (log_step if positive else -log_step)
-            return pos * (factor - 1.0)
+            if position is not None and position > 0:
+                anchor = position
+            else:
+                cx, cy = FlowCytApp._gate_centroid(gate)
+                anchor = cx if axis == "x" else cy
+                if anchor <= 0:
+                    anchor = max(lo, 1e-3)
+            return anchor * (factor - 1.0)
         else:
             step = (hi - lo) * 0.02
             return step if positive else -step
@@ -2719,6 +2984,57 @@ class FlowCytApp:
         self._refresh_plot()
         self._log("All gates cleared")
 
+    def _on_save_gates(self):
+        """Persist the current gating strategy to a sidecar JSON next to the FCS file."""
+        if self.fcs is None:
+            self._log("No file loaded")
+            return
+        if not self.gate_mgr.gates:
+            self._log("No gates to save")
+            return
+        try:
+            out = gate_io.save_gates(self.fcs.filepath, self.gate_mgr)
+            self._log(f"Saved {len(self.gate_mgr.gates)} gate(s) → {os.path.basename(out)}")
+        except Exception as exc:
+            self._log(f"Save gates failed: {exc}")
+            logger.exception("save_gates failed")
+
+    def _on_load_gates(self):
+        """Replace current gates with the strategy stored next to the FCS file."""
+        if self.fcs is None:
+            self._log("No file loaded")
+            return
+        sidecar = gate_io.sidecar_path(self.fcs.filepath)
+        if not os.path.exists(sidecar):
+            self._log(f"No saved strategy at {os.path.basename(sidecar)}")
+            return
+        self._push_undo()
+        # Drop all open sub-windows; we're about to replace the underlying gate list.
+        for uid in list(self._gate_windows.keys()):
+            self._close_gate_window(uid)
+        try:
+            result = gate_io.load_gates(
+                self.fcs.filepath, self.gate_mgr,
+                replace=True,
+                available_channels=list(self.fcs.channel_names),
+            )
+        except Exception as exc:
+            self._log(f"Load gates failed: {exc}")
+            logger.exception("load_gates failed")
+            return
+        self._selected_parent_uid = None
+        self._refresh_plot()
+        n = result.get("loaded", 0)
+        self._log(f"Loaded {n} gate(s) from {os.path.basename(sidecar)}")
+        for skipped in result.get("skipped") or []:
+            self._log(f"  skipped malformed entry: {skipped}")
+        missing = result.get("missing_channels") or []
+        if missing:
+            self._log(
+                f"  warning: {len(missing)} gate(s) reference channels not in this "
+                f"FCS file ({', '.join(missing[:5])}{'…' if len(missing) > 5 else ''})"
+            )
+
     def _on_show_summary(self):
         if self.fcs is None:
             return
@@ -2777,47 +3093,115 @@ class FlowCytApp:
 
     @staticmethod
     def _save_axes_to_file(fig, ax, filepath: str, dpi: int = 150):
-        """Save just an axes (with labels, title, ticks) to a file."""
-        # Get the full extent of the axes including tick labels and axis labels
-        renderer = fig.canvas.get_renderer()
-        bbox = ax.get_tightbbox(renderer)
-        if bbox is None:
-            bbox = ax.get_window_extent(renderer)
-        # Convert to inches for savefig
-        bbox_inches = bbox.transformed(fig.dpi_scale_trans.inverted())
-        # Add small padding
-        bbox_inches = bbox_inches.expanded(1.05, 1.05)
-        fig.savefig(filepath, dpi=dpi, bbox_inches=bbox_inches,
-                    facecolor="white", edgecolor="none")
+        """Save just an axes (with labels, title, ticks) to a file.
+
+        Calls ``fig.canvas.draw()`` first so ``get_renderer()`` is
+        guaranteed to return a usable renderer — without this some
+        backends (notably QtAgg on Windows) hand back ``None`` and
+        ``savefig`` ends up writing an empty / nonsense file with the
+        requested filename but no image data inside.
+
+        On any failure to compute the tight bbox we fall back to
+        ``bbox_inches="tight"`` so the user still gets a saved figure
+        rather than a silent error.
+        """
+        try:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            bbox = ax.get_tightbbox(renderer)
+            if bbox is None:
+                bbox = ax.get_window_extent(renderer)
+            bbox_inches = bbox.transformed(fig.dpi_scale_trans.inverted())
+            bbox_inches = bbox_inches.expanded(1.05, 1.05)
+            fig.savefig(
+                filepath, dpi=dpi, bbox_inches=bbox_inches,
+                facecolor="white", edgecolor="none",
+            )
+        except Exception:
+            # Fall back to a whole-figure tight save — always produces a
+            # valid file even if the per-axes bbox path failed.
+            fig.savefig(
+                filepath, dpi=dpi, bbox_inches="tight",
+                facecolor="white", edgecolor="none",
+            )
+
+    @staticmethod
+    def _ask_save_path(default_name: str, filetypes: list[tuple[str, str]],
+                       default_ext: str, title: str = "Save") -> str | None:
+        """Open a native Save As dialog and return the chosen path.
+
+        Uses ``tkinter.filedialog`` which renders a real Windows / macOS
+        / GTK system dialog — much more reliable than the matplotlib
+        TextBox popup we used before, which on Windows would silently
+        treat the typed name as a relative path that ended up sitting in
+        an arbitrary working directory or, worse, with no extension.
+
+        Returns ``None`` if the user cancels.  Falls back to writing to
+        the user's home directory if Tk isn't usable for any reason.
+        """
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+            path = filedialog.asksaveasfilename(
+                title=title,
+                initialfile=default_name,
+                defaultextension=default_ext,
+                filetypes=filetypes,
+            )
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return path or None
+        except Exception:
+            # No usable Tk — just dump into the user's home directory.
+            from pathlib import Path
+            return str(Path.home() / default_name)
 
     def _on_save_plot(self):
-        """Save the main plot axes to a PNG file."""
+        """Save the main plot to an image file via a native Save dialog."""
         if self.fcs is None:
             self._log("No file loaded")
             return
 
-        # Build default filename from current file + channels
-        base = Path(self._fcs_files[self._fcs_file_idx]).stem if self._fcs_files and self._fcs_file_idx >= 0 else "plot"
+        base = (Path(self._fcs_files[self._fcs_file_idx]).stem
+                if self._fcs_files and self._fcs_file_idx >= 0 else "plot")
         xi, yi, xn, yn = self._current_xy()
         suffix = f"_{xn}_vs_{yn}" if self._view_mode == "2D" else f"_{xn}_1D"
-        # Sanitise channel names for filename
-        safe = lambda s: s.replace("/", "-").replace(" ", "_").replace(":", "-")
+        safe = lambda s: (
+            s.replace("/", "-").replace("\\", "-").replace(" ", "_")
+             .replace(":", "-").replace("*", "").replace("?", "")
+             .replace("\"", "").replace("<", "").replace(">", "").replace("|", "")
+        )
         default_name = f"{safe(base)}{safe(suffix)}.png"
 
-        # Show a save dialog — use popup with text input
-        def on_save(fname):
-            fpath = Path(fname)
-            if not fpath.suffix:
-                fpath = fpath.with_suffix(".png")
-            try:
-                self._save_axes_to_file(self.fig, self.ax_main, str(fpath))
-                self._log(f"Plot saved to {fpath}")
-            except Exception as exc:
-                self._log(f"Save error: {exc}")
-
-        self._show_text_input(
-            "Save Plot", "Save plot as:", default_name, on_save
+        path = self._ask_save_path(
+            default_name=default_name,
+            filetypes=[("PNG image", "*.png"),
+                       ("PDF document", "*.pdf"),
+                       ("SVG vector", "*.svg"),
+                       ("All files", "*.*")],
+            default_ext=".png",
+            title="Save Plot",
         )
+        if not path:
+            self._log("Save cancelled")
+            return
+
+        fpath = Path(path)
+        if not fpath.suffix:
+            fpath = fpath.with_suffix(".png")
+        try:
+            self._save_axes_to_file(self.fig, self.ax_main, str(fpath))
+            self._log(f"Plot saved to {fpath}")
+        except Exception as exc:
+            self._log(f"Save error: {exc}")
 
     def _on_export_csv(self):
         """Export gated events to CSV - saves directly to workspace folder."""
@@ -3131,6 +3515,7 @@ class GateWindow:
         rs = 0.70
         cw = 0.27
         btn_h = 0.035
+        btn_gap = 0.004     # matches the main-window layout constant
         small = 0.05
         lw = cw - 2 * small
 
@@ -3138,7 +3523,7 @@ class GateWindow:
 
         # X channel
         self.fig.text(rs, y_cur, "X Channel", fontsize=8, fontweight="bold")
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
         ax_xp = self.fig.add_axes([rs, y_cur, small, btn_h])
         self._btn_xp = Button(ax_xp, "<")
         self._btn_xp.on_clicked(lambda e: self._cycle("x", -1))
@@ -3150,7 +3535,7 @@ class GateWindow:
         self._btn_xn.on_clicked(lambda e: self._cycle("x", +1))
 
         # Y channel
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
         self.fig.text(rs, y_cur + btn_h, "Y Channel", fontsize=8, fontweight="bold")
         y_cur -= 0.01
         ax_yp = self.fig.add_axes([rs, y_cur, small, btn_h])
@@ -3185,7 +3570,7 @@ class GateWindow:
         self._compress_dragging: bool = False
         self._compress_drag_px: float = 0.0
         self._compress_base_frac: float = 0.5
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
         ax_vm = self.fig.add_axes([rs, y_cur, cw, btn_h])
         self._btn_vm = Button(ax_vm, "View: 2D Scatter")
         self._btn_vm.on_clicked(lambda e: self._toggle_view())
@@ -3228,12 +3613,12 @@ class GateWindow:
         self._btn_remove = Button(ax_rm, "Remove Gate...")
         self._btn_remove.on_clicked(lambda e: self._on_remove_gate())
 
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
         ax_clr = self.fig.add_axes([rs, y_cur, cw, btn_h])
         self._btn_clear = Button(ax_clr, "Clear Child Gates")
         self._btn_clear.on_clicked(lambda e: self._on_clear_child_gates())
 
-        y_cur -= btn_h + 0.005
+        y_cur -= btn_h + btn_gap
         ax_save = self.fig.add_axes([rs, y_cur, cw, btn_h])
         self._btn_save = Button(ax_save, "Save Plot...")
         self._btn_save.on_clicked(lambda e: self._on_save_plot())
@@ -3254,6 +3639,7 @@ class GateWindow:
         self.fig.canvas.mpl_connect("close_event", self._on_close)
 
         FlowCytApp._disable_tk_tab_traversal(self.fig)
+        install_tk_click_bridge(self.fig)
 
         self._update_labels()
         self._refresh()
@@ -3817,16 +4203,21 @@ class GateWindow:
                 self.app._push_undo()
                 gate = self._stretch_selected_gate
                 idx = self._stretch_point_idx
+                # Same fix as the main window: anchor the log-mode step
+                # at the point being stretched, not the gate centroid.
+                px, py = self._stretch_points[idx]
                 dx, dy = 0.0, 0.0
                 if direction in ("left", "right"):
                     dx = FlowCytApp._scale_aware_step(
                         self.ax, gate, "x",
                         self._x_scale, direction == "right",
+                        position=px,
                     ) * scale
                 else:
                     dy = FlowCytApp._scale_aware_step(
                         self.ax, gate, "y",
                         self._y_scale, direction == "up",
+                        position=py,
                     ) * scale
                 self.app._apply_stretch_point(gate, idx, dx, dy)
                 self._stretch_points = FlowCytApp._get_stretch_points(gate)
@@ -4380,26 +4771,37 @@ class GateWindow:
     #  Actions
     # ================================================================ #
     def _on_save_plot(self):
-        """Save just the data axes of this gate window."""
-        base = self.gate.name.replace("/", "-").replace(" ", "_")
+        """Save just the data axes of this gate window via a native dialog."""
         xi, yi, xn, yn = self._current_xy()
-        safe = lambda s: s.replace("/", "-").replace(" ", "_").replace(":", "-")
-        suffix = f"_{safe(xn)}_vs_{safe(yn)}" if self._view_mode == "2D" else f"_{safe(xn)}_1D"
-        default_name = f"{safe(base)}{suffix}.png"
-
-        def on_save(fname):
-            fpath = Path(fname)
-            if not fpath.suffix:
-                fpath = fpath.with_suffix(".png")
-            try:
-                FlowCytApp._save_axes_to_file(self.fig, self.ax, str(fpath))
-                self.app._log(f"[{self.gate.name}] Plot saved to {fpath}")
-            except Exception as exc:
-                self.app._log(f"[{self.gate.name}] Save error: {exc}")
-
-        self.app._show_text_input(
-            "Save Plot", "Save plot as:", default_name, on_save
+        safe = lambda s: (
+            s.replace("/", "-").replace("\\", "-").replace(" ", "_")
+             .replace(":", "-").replace("*", "").replace("?", "")
+             .replace("\"", "").replace("<", "").replace(">", "").replace("|", "")
         )
+        base = safe(self.gate.name)
+        suffix = f"_{safe(xn)}_vs_{safe(yn)}" if self._view_mode == "2D" else f"_{safe(xn)}_1D"
+        default_name = f"{base}{suffix}.png"
+
+        path = FlowCytApp._ask_save_path(
+            default_name=default_name,
+            filetypes=[("PNG image", "*.png"),
+                       ("PDF document", "*.pdf"),
+                       ("SVG vector", "*.svg"),
+                       ("All files", "*.*")],
+            default_ext=".png",
+            title=f"Save Plot ({self.gate.name})",
+        )
+        if not path:
+            self.app._log(f"[{self.gate.name}] Save cancelled")
+            return
+        fpath = Path(path)
+        if not fpath.suffix:
+            fpath = fpath.with_suffix(".png")
+        try:
+            FlowCytApp._save_axes_to_file(self.fig, self.ax, str(fpath))
+            self.app._log(f"[{self.gate.name}] Plot saved to {fpath}")
+        except Exception as exc:
+            self.app._log(f"[{self.gate.name}] Save error: {exc}")
 
     def _on_remove_gate(self):
         """Remove a child gate created in this window."""

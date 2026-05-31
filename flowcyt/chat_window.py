@@ -19,8 +19,8 @@ import logging
 import textwrap
 
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Button, TextBox
 
+from ._widgets import Button, TextBox, install_tk_click_bridge  # macOS-friendly variants
 from . import tools as tools_mod
 from .llm import (
     DeepSeekClient, DeepSeekError,
@@ -69,9 +69,12 @@ class ChatWindow:
     # ----------------------------------------------------------------- #
     def _build_ui(self):
         api_key = load_api_key()
-        self.fig = plt.figure("FlowCyt Assistant", figsize=(9, 9))
+        # Slightly larger figure so the input field and transcript
+        # comfortably hold long lines of text.
+        self.fig = plt.figure("FlowCyt Assistant", figsize=(11, 9.5))
         self.fig.clf()
         self.fig.canvas.mpl_connect("close_event", self._on_close)
+        install_tk_click_bridge(self.fig)
 
         if not api_key:
             self._build_key_entry()
@@ -174,24 +177,33 @@ class ChatWindow:
         self.btn_refresh.on_clicked(lambda _e: self._refresh_balance())
 
         # History axes.
-        self._ax_history = self.fig.add_axes([0.02, 0.16, 0.96, 0.76])
+        self._ax_history = self.fig.add_axes([0.02, 0.17, 0.96, 0.74])
         self._ax_history.set_xticks([])
         self._ax_history.set_yticks([])
         for s in self._ax_history.spines.values():
             s.set_color("#cccccc")
 
-        # Input row (TextBox + Send + status).
-        self._ax_input = self.fig.add_axes([0.02, 0.05, 0.78, 0.05])
+        # Input row (TextBox + Send + status). Slightly taller and using a
+        # smaller font so users see what they type even on long messages.
+        self._ax_input = self.fig.add_axes([0.02, 0.045, 0.82, 0.07])
         self._textbox = TextBox(self._ax_input, "", initial="", label_pad=0.0)
         self._textbox.label.set_visible(False)
+        try:
+            self._textbox.text_disp.set_fontsize(10)
+            # Anchor the input text at top-left of the field so the cursor
+            # and most-recent characters stay visible when text overflows.
+            self._textbox.text_disp.set_horizontalalignment("left")
+            self._textbox.text_disp.set_verticalalignment("center")
+        except Exception:
+            pass
         self._textbox.on_submit(self._on_send_submit)
 
-        ax_send = self.fig.add_axes([0.82, 0.05, 0.16, 0.05])
+        ax_send = self.fig.add_axes([0.86, 0.045, 0.12, 0.07])
         self.btn_send = Button(ax_send, "Send")
         self.btn_send.on_clicked(self._on_send_click)
 
         # Status line (just above the input row).
-        self._ax_status = self.fig.add_axes([0.02, 0.105, 0.96, 0.035])
+        self._ax_status = self.fig.add_axes([0.02, 0.125, 0.96, 0.03])
         self._ax_status.set_xticks([])
         self._ax_status.set_yticks([])
         for s in self._ax_status.spines.values():
@@ -249,10 +261,19 @@ class ChatWindow:
             for ln in wrapped:
                 lines.append((ln, color))
 
-        # Compute visible window.
-        ax_pixels = ax.get_window_extent().height
-        line_pts = 9 * 1.25
-        max_visible = max(5, int(ax_pixels / (line_pts * 1.05)) - 1)
+        # Compute line height from the actual font size so consecutive
+        # lines don't overlap.  Convert ``fontsize * linespacing`` points
+        # into axes-fraction units via the axes' real height on the figure.
+        fontsize = 9.0
+        linespacing = 1.45
+        line_h_pts = fontsize * linespacing
+        fig_h_in = self.fig.get_figheight()
+        ax_h_frac = ax.get_position().height
+        ax_h_pts = max(ax_h_frac * fig_h_in * 72.0, 1.0)
+        line_step = line_h_pts / ax_h_pts
+
+        # How many lines can we comfortably display?
+        max_visible = max(5, int((1.0 - 0.04) / line_step))
         n_lines = len(lines)
         if n_lines <= max_visible:
             visible = lines
@@ -263,11 +284,10 @@ class ChatWindow:
             visible = lines[start:end]
 
         y = 0.98
-        line_step = 1.0 / max(max_visible, 1)
         for text, color in visible:
             ax.text(
                 0.01, y, text,
-                family="monospace", fontsize=8.5,
+                family="monospace", fontsize=fontsize,
                 va="top", ha="left", color=color,
                 transform=ax.transAxes,
             )
@@ -379,6 +399,10 @@ class ChatWindow:
         except Exception:
             pass
 
+        # Drop any mouse grab the TextBox is still holding from typing,
+        # so destructive-confirm buttons spawned mid-turn don't crash.
+        self._release_any_mouse_grab()
+
         self._set_status("Thinking…")
         try:
             usage = tools_mod.run_chat_turn(
@@ -424,6 +448,12 @@ class ChatWindow:
         self._pending_confirm = {"name": tool_name, "summary": summary, "args": args}
         self._confirm_result = None
 
+        # Critical: clear any leftover mouse grab (typically held by the
+        # input TextBox from the last time the user typed) before showing
+        # the Yes/No buttons. Without this, the Yes button's _click raises
+        # "Another Axes already grabs mouse input" and the chat locks up.
+        self._release_any_mouse_grab()
+
         # Show the confirmation entry in the transcript.
         self._append_event({
             "kind": "confirm",
@@ -440,11 +470,11 @@ class ChatWindow:
         except Exception:
             pass
 
-        self._confirm_yes_ax = self.fig.add_axes([0.30, 0.05, 0.18, 0.05])
+        self._confirm_yes_ax = self.fig.add_axes([0.30, 0.045, 0.18, 0.07])
         self._confirm_yes_btn = Button(self._confirm_yes_ax, "Yes")
         self._confirm_yes_btn.on_clicked(lambda _e: self._resolve_confirm(True))
 
-        self._confirm_no_ax = self.fig.add_axes([0.52, 0.05, 0.18, 0.05])
+        self._confirm_no_ax = self.fig.add_axes([0.52, 0.045, 0.18, 0.07])
         self._confirm_no_btn = Button(self._confirm_no_ax, "No")
         self._confirm_no_btn.on_clicked(lambda _e: self._resolve_confirm(False))
 
@@ -457,6 +487,10 @@ class ChatWindow:
                 plt.pause(0.05)
 
         result = bool(self._confirm_result)
+
+        # Drop any grab the Yes/No buttons might have taken so the next
+        # input click works.
+        self._release_any_mouse_grab()
 
         # Tear down confirmation widgets and restore the Send row.
         for ax in (self._confirm_yes_ax, self._confirm_no_ax):
@@ -475,6 +509,21 @@ class ChatWindow:
         self._pending_confirm = None
         self.fig.canvas.draw_idle()
         return result
+
+    def _release_any_mouse_grab(self):
+        """Drop whichever axes currently holds the canvas mouse grab.
+
+        matplotlib's ``release_mouse(ax)`` is a no-op if ``ax`` isn't the
+        current grabber, so the only safe call is to release the actual
+        grabber.  Safe to call when nothing holds the grab.
+        """
+        try:
+            canvas = self.fig.canvas
+            grabber = canvas.mouse_grabber
+            if grabber is not None:
+                canvas.release_mouse(grabber)
+        except Exception:
+            pass
 
     def _resolve_confirm(self, value: bool):
         self._confirm_result = value

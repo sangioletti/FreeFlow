@@ -1,15 +1,26 @@
 """
-markers.py - Per-file fluorophore -> protein marker mapping.
+markers.py - Per-file fluorophore -> protein marker mapping + hidden channels.
 
 Each FCS file may have a sidecar JSON named ``<fcs_path>.markers.json`` that
-maps fluorophore short names (FCS PnN keyword) to user-supplied protein
-markers (e.g. ``"FL1-A": "CD4"``).  When the FCS file itself carries useful
-PnS labels (long/marker names), those are used as defaults.  User overrides
-in the sidecar JSON always win.
+records:
+
+  * a ``fluorophore -> protein marker`` mapping (overrides FCS PnS labels), and
+  * an optional list of fluorophores the user has hidden from the channel
+    selectors (the underlying FCS file is *not* modified — this is purely a
+    per-user view filter).
+
+Two storage formats are supported transparently so old sidecars keep working:
+
+* Flat (legacy):   ``{"FL1-A": "CD4", "FL2-A": "CD8"}``
+* Structured:     ``{"markers": {...}, "hidden": ["FSC-W", ...]}``
+
+When ``save_markers`` is asked to persist a hidden list (or there's already a
+hidden list on disk), the structured format is written.
 
 Public API:
-    load_markers(fcs_path)
-    save_markers(fcs_path, mapping)
+    load_markers(fcs_path, fcs=None)
+    load_hidden_channels(fcs_path)
+    save_markers(fcs_path, mapping, fcs=None, hidden=None)
     effective_channel_label(short_name, marker_map)
 """
 
@@ -41,6 +52,50 @@ def _pns_defaults_from_fcs(fcs) -> dict[str, str]:
     return defaults
 
 
+def _read_sidecar(fcs_path: str) -> tuple[dict[str, str], set[str]]:
+    """Read the sidecar JSON and return ``(overrides, hidden)``.
+
+    Supports both the legacy flat format and the structured format.
+    Missing file → ``({}, set())``.  Malformed JSON is logged and treated
+    as an empty file.
+    """
+    sidecar = _sidecar_path(fcs_path)
+    if not os.path.exists(sidecar):
+        return {}, set()
+
+    try:
+        with open(sidecar, "r") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Failed to read marker sidecar %s: %s", sidecar, e)
+        return {}, set()
+
+    if not isinstance(data, dict):
+        return {}, set()
+
+    if "markers" in data or "hidden" in data:
+        # Structured format.
+        raw_markers = data.get("markers", {}) or {}
+        raw_hidden = data.get("hidden", []) or []
+    else:
+        # Legacy flat format — every string value is a marker override.
+        raw_markers = data
+        raw_hidden = []
+
+    overrides: dict[str, str] = {}
+    if isinstance(raw_markers, dict):
+        for k, v in raw_markers.items():
+            if isinstance(k, str) and isinstance(v, str) and v:
+                overrides[k] = v
+
+    hidden: set[str] = set()
+    if isinstance(raw_hidden, (list, tuple, set)):
+        for entry in raw_hidden:
+            if isinstance(entry, str) and entry:
+                hidden.add(entry)
+    return overrides, hidden
+
+
 def load_markers(fcs_path: str, fcs=None) -> dict[str, str]:
     """Load merged marker map for a given FCS file.
 
@@ -54,34 +109,38 @@ def load_markers(fcs_path: str, fcs=None) -> dict[str, str]:
     merged: dict[str, str] = {}
     if fcs is not None:
         merged.update(_pns_defaults_from_fcs(fcs))
-
-    sidecar = _sidecar_path(fcs_path)
-    if os.path.exists(sidecar):
-        try:
-            with open(sidecar, "r") as fh:
-                overrides = json.load(fh)
-            if isinstance(overrides, dict):
-                for k, v in overrides.items():
-                    if isinstance(k, str) and isinstance(v, str) and v:
-                        merged[k] = v
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("Failed to read marker sidecar %s: %s", sidecar, e)
-
+    overrides, _hidden = _read_sidecar(fcs_path)
+    merged.update(overrides)
     return merged
+
+
+def load_hidden_channels(fcs_path: str) -> set[str]:
+    """Return the set of fluorophore short names the user has hidden."""
+    _overrides, hidden = _read_sidecar(fcs_path)
+    return hidden
 
 
 def save_markers(
     fcs_path: str,
     mapping: dict[str, str],
     fcs=None,
+    hidden: Iterable[str] | None = None,
 ) -> None:
-    """Persist marker overrides to ``<fcs_path>.markers.json``.
+    """Persist marker overrides (and optionally a hidden-channel list) to
+    ``<fcs_path>.markers.json``.
 
     Only entries that differ from the FCS PnS defaults (when ``fcs`` is
-    provided) are written, keeping the sidecar minimal. Empty marker
+    provided) are written, keeping the sidecar minimal.  Empty marker
     strings are treated as "delete this entry".
+
+    ``hidden=None`` preserves whatever's already on disk; pass an empty
+    iterable to explicitly clear the hidden list.  When ``hidden`` ends
+    up non-empty (or one already existed on disk), the structured format
+    is written; otherwise the legacy flat format keeps backward
+    compatibility.
     """
     defaults = _pns_defaults_from_fcs(fcs) if fcs is not None else {}
+
     to_save: dict[str, str] = {}
     for short, marker in mapping.items():
         if not isinstance(short, str) or not isinstance(marker, str):
@@ -89,19 +148,35 @@ def save_markers(
         marker = marker.strip()
         if not marker:
             continue
-        # Skip entries that match the PnS default — no need to override.
         if defaults.get(short) == marker:
             continue
         to_save[short] = marker
 
+    # Hidden-channel resolution: explicit arg wins, otherwise preserve
+    # whatever is already on disk.
+    if hidden is None:
+        _existing, on_disk_hidden = _read_sidecar(fcs_path)
+        hidden_set = set(on_disk_hidden)
+    else:
+        hidden_set = {s for s in hidden if isinstance(s, str) and s}
+
     sidecar = _sidecar_path(fcs_path)
     try:
-        if to_save:
-            with open(sidecar, "w") as fh:
-                json.dump(to_save, fh, indent=2, sort_keys=True)
-        elif os.path.exists(sidecar):
-            # Nothing to save and file exists -> remove it for cleanliness.
-            os.remove(sidecar)
+        if not to_save and not hidden_set:
+            if os.path.exists(sidecar):
+                os.remove(sidecar)
+            return
+        if hidden_set:
+            # Structured format — necessary to carry the hidden list.
+            payload = {
+                "markers": dict(sorted(to_save.items())),
+                "hidden": sorted(hidden_set),
+            }
+        else:
+            # No hidden state — keep the legacy flat format for simplicity.
+            payload = dict(sorted(to_save.items()))
+        with open(sidecar, "w") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
     except OSError as e:
         logger.error("Failed to write marker sidecar %s: %s", sidecar, e)
         raise
