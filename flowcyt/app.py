@@ -68,6 +68,7 @@ from .markers import (
     load_markers, load_hidden_channels, effective_channel_label,
 )
 from . import gate_io
+from . import theme as _theme
 
 # ------------------------------------------------------------------ #
 #  Constants
@@ -240,6 +241,12 @@ class FlowCytApp:
     def _build_ui(self):
         self.fig = plt.figure("FlowCyt", figsize=(14, 9))
         self.fig.subplots_adjust(left=0.05, right=0.98, top=0.95, bottom=0.05)
+
+        # Cohesive theme: window tint + tinted right-panel backdrop.
+        # Both go in BEFORE any widget axes so they sit at z-order -10
+        # and never overlap the controls.
+        _theme.style_window(self.fig)
+        _theme.panel_background(self.fig, 0.675, 0.025, 0.300, 0.945)
 
         # LEFT SIDE: Main scatter plot (bigger) + statistics
         # Plot sits higher to leave room for x-axis label + gap + stats
@@ -437,6 +444,11 @@ class FlowCytApp:
         self.ax_messages.set_xticks([])
         self.ax_messages.set_yticks([])
 
+        # Cosmetic theme pass — recolours buttons, radios, section headers,
+        # the stats panel and the message-log panel.  Does not move or
+        # rewire any widget.
+        self._apply_theme()
+
         # Connect canvas events
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
@@ -458,6 +470,53 @@ class FlowCytApp:
         self._fcs_files: list[str] = []   # List of absolute paths to FCS files
         self._fcs_file_idx: int = -1       # Index of currently loaded file
         self._scan_dir: str | None = None  # Directory being scanned
+
+    # ================================================================ #
+    #  Theme application — batch recolour after the layout is built
+    # ================================================================ #
+    def _apply_theme(self):
+        """Apply the FreeFlow light theme to every styled artist.
+
+        Pure cosmetic pass — no widget is moved, recreated, or rewired.
+        All operations swallow exceptions so a future matplotlib API
+        change degrades gracefully instead of crashing the app.
+        """
+        # 1) Section-header bold text artists (Tool, Parent Gate, X / Y
+        #    Channel, Scale, File, Message Log, etc.).
+        for txt in list(self.fig.texts):
+            try:
+                if txt.get_fontweight() in ("bold", 700, "700"):
+                    _theme.style_section_header(txt)
+            except Exception:
+                pass
+
+        # 2) Every Button on the main window.
+        for btn_name in (
+            "btn_fprev", "btn_flabel", "btn_fnext",
+            "btn_xprev", "btn_xlabel", "btn_xnext",
+            "btn_yprev", "btn_ylabel", "btn_ynext",
+            "btn_xscale", "btn_yscale", "btn_viewmode",
+            "btn_scandir", "btn_summary", "btn_export",
+            "btn_rename", "btn_remove", "btn_clear", "btn_save",
+            "btn_save_gates", "btn_load_gates",
+            "btn_chat", "btn_markers",
+        ):
+            _theme.style_button(getattr(self, btn_name, None))
+
+        # 3) The Tool RadioButtons (Parent radio is themed in
+        #    _refresh_parent_selector when it's (re)created).
+        _theme.style_radio(getattr(self, "radio_mode", None),
+                           getattr(self, "ax_mode", None))
+
+        # 4) Stats panel + message log get the tinted panel treatment.
+        _theme.style_stats_panel(getattr(self, "ax_stats", None))
+        _theme.style_message_log(getattr(self, "ax_messages", None))
+
+        # 5) Subtle dividers between major right-panel sections.
+        right_start = 0.68
+        ctrl_w = 0.29
+        for y in (0.728, 0.685):  # below scale row, below view-mode row
+            _theme.divider(self.fig, right_start, right_start + ctrl_w, y)
 
     # ================================================================ #
     #  File loading & file selector
@@ -1481,6 +1540,7 @@ class FlowCytApp:
                     self.ax_main.set_xlabel(x_label)
                 self.ax_main.set_ylabel("Density")
                 self.ax_main.set_title(f"1D Histogram — {x_label}")
+                _theme.style_plot_axes(self.ax_main)
 
                 if pw is None:
                     if self._x_scale == "log":
@@ -1493,6 +1553,9 @@ class FlowCytApp:
             else:
                 # ── 2D scatter view ──
                 density_scatter(self.ax_main, x, y)
+                # density_scatter calls ax.clear() internally, so re-apply
+                # the soft grid + spine treatment every refresh.
+                _theme.style_plot_axes(self.ax_main)
                 self.ax_main.set_xlabel(x_label)
                 self.ax_main.set_ylabel(y_label)
 
@@ -1612,6 +1675,7 @@ class FlowCytApp:
 
         self._radio_parent = RadioButtons(self.ax_parent, options, active=active_idx)
         self._radio_parent.on_clicked(self._on_parent_change)
+        _theme.style_radio(self._radio_parent, self.ax_parent)
         # DON'T reset _selected_parent_uid - preserve the current selection!
 
         if not had_gates and self.gate_mgr.gates:
@@ -3557,6 +3621,8 @@ class GateWindow:
         self._child_windows: dict[str, "GateWindow"] = {}
 
         self.fig = plt.figure(f"Gate: {gate.name}", figsize=(10, 8))
+        _theme.style_window(self.fig)
+        _theme.panel_background(self.fig, 0.69, 0.04, 0.295, 0.93)
         self.fig.subplots_adjust(left=0.08, right=0.72, top=0.93, bottom=0.08)
 
         # Main scatter axes
@@ -3691,6 +3757,27 @@ class GateWindow:
 
         FlowCytApp._disable_tk_tab_traversal(self.fig)
         install_tk_click_bridge(self.fig)
+
+        # Cosmetic theme pass on this sub-window.
+        for txt in list(self.fig.texts):
+            try:
+                if txt.get_fontweight() in ("bold", 700, "700"):
+                    _theme.style_section_header(txt)
+            except Exception:
+                pass
+        for attr in dir(self):
+            if not attr.startswith("_btn_") and not attr.startswith("btn_"):
+                continue
+            obj = getattr(self, attr, None)
+            try:
+                from matplotlib.widgets import Button as _MplBtn
+                if isinstance(obj, _MplBtn):
+                    _theme.style_button(obj)
+            except Exception:
+                pass
+        _theme.style_radio(getattr(self, "radio_mode", None),
+                           getattr(self, "ax_mode", None))
+        _theme.style_stats_panel(getattr(self, "ax_stats", None))
 
         self._update_labels()
         self._refresh()

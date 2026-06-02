@@ -19,6 +19,7 @@ import logging
 import matplotlib.pyplot as plt
 
 from ._widgets import Button, TextBox, install_tk_click_bridge  # macOS-friendly variants
+from . import theme as _theme
 from .markers import (
     effective_channel_label, load_hidden_channels, load_markers, save_markers,
 )
@@ -48,6 +49,7 @@ class MarkersWindow:
         if self.app.fcs is None:
             # Tiny "load a file first" placeholder.
             self.fig = plt.figure("Marker Mapping", figsize=(5, 2.5))
+            _theme.style_window(self.fig)
             self.fig.clf()
             install_tk_click_bridge(self.fig)
             ax = self.fig.add_axes([0.05, 0.05, 0.9, 0.9])
@@ -69,6 +71,7 @@ class MarkersWindow:
         # Figure height scales with channel count, capped to keep things sane.
         fig_h = max(4.5, min(0.50 * n + 2.4, 13.0))
         self.fig = plt.figure("Marker Mapping", figsize=(8.5, fig_h))
+        _theme.style_window(self.fig)
         self.fig.clf()
         install_tk_click_bridge(self.fig)
 
@@ -174,6 +177,19 @@ class MarkersWindow:
         ax_close = self.fig.add_axes([start_x + 2 * (btn_w + gap), btn_y, btn_w, btn_h])
         self.btn_close = Button(ax_close, "Close")
         self.btn_close.on_clicked(self._on_close_clicked)
+
+        # Theme: section headers in accent navy + style every button + textbox.
+        for txt in list(self.fig.texts):
+            try:
+                if txt.get_fontweight() in ("bold", 700, "700"):
+                    _theme.style_section_header(txt)
+            except Exception:
+                pass
+        for btn in (self.btn_reload, self.btn_save, self.btn_close,
+                    *self._row_hide_buttons.values()):
+            _theme.style_button(btn)
+        for tb in self._row_textboxes.values():
+            _theme.style_textbox(tb)
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
         self.fig.canvas.draw_idle()

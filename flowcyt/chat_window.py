@@ -21,6 +21,7 @@ import textwrap
 import matplotlib.pyplot as plt
 
 from ._widgets import Button, TextBox, install_tk_click_bridge  # macOS-friendly variants
+from . import theme as _theme
 from . import tools as tools_mod
 from .llm import (
     DeepSeekClient, DeepSeekError,
@@ -72,6 +73,7 @@ class ChatWindow:
         # Slightly larger figure so the input field and transcript
         # comfortably hold long lines of text.
         self.fig = plt.figure("FlowCyt Assistant", figsize=(11, 9.5))
+        _theme.style_window(self.fig)
         self.fig.clf()
         self.fig.canvas.mpl_connect("close_event", self._on_close)
         install_tk_click_bridge(self.fig)
@@ -118,6 +120,8 @@ class ChatWindow:
         ax_save = self.fig.add_axes([0.35, 0.42, 0.30, 0.07])
         self.btn_save_key = Button(ax_save, "Save key")
         self.btn_save_key.on_clicked(self._on_save_key)
+        _theme.style_button(self.btn_save_key)
+        _theme.style_textbox(self._key_textbox)
 
         self.fig.text(
             0.5, 0.30,
@@ -201,6 +205,27 @@ class ChatWindow:
         ax_send = self.fig.add_axes([0.86, 0.045, 0.12, 0.07])
         self.btn_send = Button(ax_send, "Send")
         self.btn_send.on_clicked(self._on_send_click)
+
+        # Theme: tint balance/session header text + style buttons + tint
+        # the history axes with the soft panel background.
+        for txt in (self._balance_text, self._session_text):
+            if txt is not None:
+                try:
+                    txt.set_color(_theme.PALETTE["accent"])
+                    txt.set_fontweight("bold")
+                except Exception:
+                    pass
+        _theme.style_button(self.btn_send)
+        _theme.style_button(getattr(self, "btn_refresh", None))
+        _theme.style_textbox(self._textbox)
+        if getattr(self, "_ax_history", None) is not None:
+            try:
+                self._ax_history.set_facecolor("white")
+                for sp in ("top", "right", "bottom", "left"):
+                    self._ax_history.spines[sp].set_edgecolor(_theme.PALETTE["border"])
+                    self._ax_history.spines[sp].set_linewidth(0.8)
+            except Exception:
+                pass
 
         # Status line (just above the input row).
         self._ax_status = self.fig.add_axes([0.02, 0.125, 0.96, 0.03])
