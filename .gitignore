@@ -1,0 +1,39 @@
+# Python build / cache artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.build-cache/
+build/
+dist/
+AppDir/
+
+# PyInstaller intermediates
+*.manifest
+*.spec.bak
+
+# Runtime + user data — never commit these
+flowcyt.log
+*.deepseek_api_key
+.deepseek_api_key
+deepseek_api_key
+
+# Per-FCS-file sidecars created by the app itself
+*.fcs.gates.json
+*.fcs.markers.json
+
+# Local screenshot exports
+*.png
+!docs/**/*.png
+
+# Editor / OS scratch files
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Local virtual environments
+.venv/
+venv/
+env/
