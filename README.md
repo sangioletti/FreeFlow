@@ -1,4 +1,4 @@
-# FreeFlow — FCS Viewer & Gating Tool
+# FreeFlow — Open Source software for flow cytometry analysis
 
 FreeFlow is a lightweight, scriptable, and conversational flow-cytometry
 viewer. It opens raw `.fcs` files, lets you draw polygon / rectangle /
@@ -641,11 +641,7 @@ of the time and care that goes into building a tool like this.
 
 **Transfer details**
 
-> *Bank transfer (IBAN / SWIFT):* _to be filled in by the author_
->
-> *PayPal:* _to be filled in by the author_
->
-> *Other (e.g. GitHub Sponsors, Stripe, Wise):* _to be filled in by the author_
+> **PayPal:** [paypal.me/StenoAU](https://paypal.me/StenoAU)
 
 If you'd like to donate but the option above isn't convenient for you,
 get in touch at the email above and we'll arrange something that works.
