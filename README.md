@@ -40,22 +40,28 @@ client (`requests`) for the optional chat assistant.
 FreeFlow runs on **macOS, Linux, and Windows**.  Pick the path that
 matches your platform and comfort level with Python.
 
-### For Windows users — download the executable (no Python needed)
+### Quickest path — download the prebuilt binary (no Python needed)
 
-The simplest option on Windows is to grab the prebuilt `.exe`:
+The project's **Releases** page ships a ready-to-run binary for each
+major OS — no Python install, no `pip` commands, no compiling.  Each
+release has three assets:
 
-1. Open the project's **Releases** page on GitHub.
-2. Download `FreeFlow.exe` from the latest release.
-3. Double-click it. That's it — no Python, NumPy, or matplotlib install
-   required. Drop `.fcs` files in the same folder as the `.exe` (or
-   anywhere — use the **File** picker once it's running).
+| OS | Asset name | What to do with it |
+|---|---|---|
+| **Windows** | `FreeFlow-Windows.exe` | Download. Double-click. |
+| **macOS** | `FreeFlow-macOS.zip` | Unzip. Drag `FreeFlow.app` into `/Applications`. First launch: right-click → *Open* (Gatekeeper warning, since the bundle is unsigned). |
+| **Linux** | `FreeFlow-Linux-x86_64.AppImage` | Download. `chmod +x FreeFlow-Linux-x86_64.AppImage`. Double-click or run from a terminal. |
 
-If you'd rather build the `.exe` yourself (or you're on a corporate
-machine that blocks downloads), see
-[Building the Windows executable from source](#building-the-windows-executable-from-source)
+The macOS bundle is an Intel build, so it runs natively on Intel Macs
+and under Rosetta 2 on Apple Silicon — no separate arm64 version yet.
+The Linux AppImage is x86_64.
+
+If you'd rather build the binaries yourself (corporate download blocks,
+unfamiliar OS, hands-on curiosity), see
+[Building the binaries from source](#building-the-binaries-from-source)
 further down.
 
-### For macOS / Linux — install from source
+### For developers — install from source
 
 #### Requirements
 
@@ -98,72 +104,84 @@ flowcyt --info Test_sample.fcs
 This prints the FCS file metadata and exits — no GUI. If you see the
 channel list, you're good.
 
-### Building the Windows executable from source
+### Building the binaries from source
 
 The repository ships a PyInstaller specification (`freeflow.spec`)
-plus a convenience batch script (`build_windows.bat`) that bundles the
-whole app — Python interpreter, NumPy, matplotlib, Qt, the DeepSeek
-client — into one standalone `FreeFlow.exe`.
+plus three convenience build scripts that bundle the whole app —
+Python interpreter, NumPy, matplotlib, Qt, the DeepSeek client — into
+the right per-OS shape.
 
-On a Windows machine:
+| Platform | Script | Output |
+|---|---|---|
+| Windows | `build_windows.bat` | `dist\FreeFlow.exe` (~50–80 MB single file) |
+| macOS | `./build_macos.sh` | `dist/FreeFlow.app` + zipped `dist/FreeFlow-macOS.zip` |
+| Linux | `./build_linux.sh` | `dist/FreeFlow-x86_64.AppImage` (single executable) |
 
-```powershell
-# One-command path — just runs the lines below for you
-.\build_windows.bat
+Each script does the same thing under the hood (`pyinstaller --clean
+--noconfirm freeflow.spec` plus a per-OS post-step) so you can also
+run the commands by hand:
 
-# Manual path
+```bash
+# All three OSes
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install PyQt5 pyinstaller
 pyinstaller --clean --noconfirm freeflow.spec
-.\dist\FreeFlow.exe
+
+# macOS additional step
+cd dist && zip -ry FreeFlow-macOS.zip FreeFlow.app && cd ..
+
+# Linux additional step — wrap dist/FreeFlow into an AppImage
+# (see build_linux.sh for the AppDir layout + appimagetool call)
 ```
 
-This typically produces a `~50–80 MB` single file.  No installation,
-no PATH changes — copy `dist\FreeFlow.exe` anywhere and double-click.
+### CI build & "I made a release but the binaries didn't appear"
 
-### CI build & "I made a release but the .exe didn't appear"
+`.github/workflows/build-binaries.yml` runs a **3-OS matrix** —
+Windows, macOS, Linux — on every `vX.Y.Z` tag push, every release
+published via the GitHub UI, and on manual workflow dispatch. Each
+job's binary is attached to the matching release page so end users can
+download it directly.
 
-`.github/workflows/build-windows.yml` builds `FreeFlow.exe` on every
-`vX.Y.Z` tag push, every release published via the GitHub UI, and on
-manual workflow dispatch. The built `.exe` is attached to the matching
-release page so end users can download it directly.
-
-If you created a release and the `.exe` didn't show up, walk through
-this checklist — these are the three things that bite people:
+If you created a release and the binaries didn't show up, walk through
+this checklist — three things bite people:
 
 1. **Check the Actions tab on GitHub.** The workflow should appear
-   under *Build Windows executable* with the run that corresponds to
-   your release.  If no run appears at all, jump to step 2 or 3.  If a
-   run is there but red, click into it — the most common failure is a
-   PyInstaller issue surfaced in the *Build FreeFlow.exe* step, or a
-   `Resource not accessible by integration` error in the *Attach…*
-   step (the permissions fix is already in the workflow, but a fork
-   may strip it).
+   under *Build cross-platform binaries* with a job per matrix entry
+   (Windows / macOS / Linux). If no run appears at all, jump to step
+   2 or 3. If a run is there but red, click into it — the most common
+   failure is a PyInstaller issue surfaced in the *Build with
+   PyInstaller* step, or a `Resource not accessible by integration`
+   error in the *Attach binary to GitHub Release* step (the
+   permissions fix is already in the workflow, but a fork may strip it).
 2. **`GITHUB_TOKEN` permissions.** On repos created after February
-   2023, the default token is read-only.  The workflow now declares
+   2023, the default token is read-only.  The workflow declares
    `permissions: contents: write` at the job level, but if you've also
    set repo-wide *Settings → Actions → General → Workflow permissions*
    to "Read repository contents and packages permissions", flip it to
    *Read and write permissions*.  Without write access, the upload
-   step silently fails and the `.exe` never appears on the release.
+   step silently fails and the binary never appears on the release.
 3. **The tagged commit didn't include the workflow file.** Actions
    only sees a workflow file if it's present at the commit being
    built.  If you tagged a commit older than the one that added
-   `build-windows.yml`, no run is queued.  Fix: either re-tag a newer
+   `build-binaries.yml`, no run is queued.  Fix: either re-tag a newer
    commit, or trigger the workflow manually from the *Actions* tab via
    *workflow_dispatch* (input the release tag in the form) — it'll
-   build the binary against the current `main` and attach it.
+   build all three binaries against the current `main` and attach
+   them to the named release.
 
-If CI is still misbehaving you always have the local fallback:
+Local fallback if CI is still misbehaving:
 
-```powershell
-.\build_windows.bat
-# then drag dist\FreeFlow.exe onto the release page in the GitHub UI
+```bash
+# On the OS that's missing
+.\build_windows.bat        # Windows
+./build_macos.sh           # macOS
+./build_linux.sh           # Linux
+# then drag the produced binary from dist/ onto the release page in the GitHub UI
 ```
 
-The script does exactly what the CI does, so the resulting `.exe`
-is identical.
+The scripts do exactly what CI does, so the resulting binaries are
+identical.
 
 ---
 
@@ -578,9 +596,11 @@ FreeFlow/
 │   ├── theme.py              # Cohesive light-theme palette + style helpers
 │   └── tools.py              # Tool schemas + dispatcher + agentic loop for the chat assistant
 ├── .github/workflows/
-│   └── build-windows.yml     # CI: build dist/FreeFlow.exe on each tag, attach to release
-├── freeflow.spec             # PyInstaller spec used to build the Windows executable
-├── build_windows.bat         # One-click local Windows build script (calls pyinstaller)
+│   └── build-binaries.yml    # CI: build Windows/macOS/Linux binaries, attach to release
+├── freeflow.spec             # PyInstaller spec — builds .exe on Windows, .app on macOS, ELF on Linux
+├── build_windows.bat         # One-click local Windows build → dist\FreeFlow.exe
+├── build_macos.sh            # One-click local macOS build  → dist/FreeFlow.app + .zip
+├── build_linux.sh            # One-click local Linux build  → dist/FreeFlow-x86_64.AppImage
 ├── LICENSE                   # MIT license + extended disclaimer
 ├── setup.py
 ├── requirements.txt
