@@ -3279,6 +3279,48 @@ class FlowCytApp:
             from pathlib import Path
             return str(Path.home() / default_name)
 
+    @staticmethod
+    def _ask_open_path(filetypes: list[tuple[str, str]],
+                       title: str = "Open") -> str | None:
+        """Open a native Open dialog and return the chosen path (or ``None``).
+
+        Mirrors ``_ask_save_path``: Qt's QFileDialog first when the
+        backend is Qt-based (works perfectly on macOS / Windows /
+        Linux), tkinter's filedialog second, and a graceful ``None``
+        return if neither is usable.
+        """
+        backend = matplotlib.get_backend().lower()
+        if "qt" in backend:
+            try:
+                from matplotlib.backends.qt_compat import QtWidgets
+                filt = ";;".join(f"{name} ({pat})" for name, pat in filetypes)
+                app_qt = QtWidgets.QApplication.instance()
+                if app_qt is None:
+                    app_qt = QtWidgets.QApplication([])
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    None, title, "", filt,
+                )
+                return path or None
+            except Exception:
+                pass
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+            path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return path or None
+        except Exception:
+            return None
+
     def _on_save_plot(self):
         """Save the main plot to an image file via a native Save dialog."""
         if self.fcs is None:

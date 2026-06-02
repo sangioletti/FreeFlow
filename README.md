@@ -37,7 +37,27 @@ client (`requests`) for the optional chat assistant.
 
 ## Installation
 
-### Requirements
+FreeFlow runs on **macOS, Linux, and Windows**.  Pick the path that
+matches your platform and comfort level with Python.
+
+### For Windows users — download the executable (no Python needed)
+
+The simplest option on Windows is to grab the prebuilt `.exe`:
+
+1. Open the project's **Releases** page on GitHub.
+2. Download `FreeFlow.exe` from the latest release.
+3. Double-click it. That's it — no Python, NumPy, or matplotlib install
+   required. Drop `.fcs` files in the same folder as the `.exe` (or
+   anywhere — use the **File** picker once it's running).
+
+If you'd rather build the `.exe` yourself (or you're on a corporate
+machine that blocks downloads), see
+[Building the Windows executable from source](#building-the-windows-executable-from-source)
+further down.
+
+### For macOS / Linux — install from source
+
+#### Requirements
 
 - Python **≥ 3.9**
 - NumPy ≥ 1.22
@@ -48,22 +68,20 @@ client (`requests`) for the optional chat assistant.
     trackpad and keyboard behaviour, and the most reliable Save As dialog.
   - **Tk** (ships with most Python distributions) — used as a fallback.
 
-### Install from source
-
 ```bash
 git clone <repo-url> freeflow
 cd freeflow/FreeFlow            # the inner directory that contains setup.py
 pip install -e .                # editable install creates the 'flowcyt' command
 ```
 
-This will install `numpy`, `matplotlib`, and `requests`. If you don't
+This installs `numpy`, `matplotlib`, and `requests`. If you don't
 already have a Qt binding, install one for the best experience:
 
 ```bash
 pip install PyQt5               # or:  pip install PySide6
 ```
 
-### Run without installing
+#### Run without installing
 
 ```bash
 cd FreeFlow
@@ -71,7 +89,7 @@ pip install -r requirements.txt
 python -m flowcyt.cli -i path/to/sample.fcs
 ```
 
-### Verify the install
+#### Verify the install
 
 ```bash
 flowcyt --info Test_sample.fcs
@@ -79,6 +97,37 @@ flowcyt --info Test_sample.fcs
 
 This prints the FCS file metadata and exits — no GUI. If you see the
 channel list, you're good.
+
+### Building the Windows executable from source
+
+The repository ships a PyInstaller specification (`freeflow.spec`) that
+bundles the whole app — Python interpreter, NumPy, matplotlib, Qt, the
+DeepSeek client — into one standalone `FreeFlow.exe`.
+
+On a Windows machine:
+
+```powershell
+# One-time setup
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install PyQt5 pyinstaller
+
+# Build
+pyinstaller --clean --noconfirm freeflow.spec
+
+# Run
+.\dist\FreeFlow.exe
+```
+
+This typically produces a `~50–80 MB` single file.  No installation,
+no PATH changes — copy `dist\FreeFlow.exe` anywhere and double-click.
+
+The build also runs automatically on the project's CI: every Git tag
+of the form `vX.Y.Z` triggers
+`.github/workflows/build-windows.yml`, which produces a fresh
+`FreeFlow.exe` on a Windows runner and attaches it to the matching
+GitHub Release. End users just download the file from the Releases
+page — no compilation needed on their side.
 
 ---
 
@@ -490,7 +539,12 @@ FreeFlow/
 │   ├── markers_window.py     # Marker editor popup
 │   ├── plotting.py           # Density scatter, gate overlays, quadrant labels, histograms
 │   ├── reader.py             # Pure-Python FCS 2.0 / 3.0 / 3.1 parser
+│   ├── theme.py              # Cohesive light-theme palette + style helpers
 │   └── tools.py              # Tool schemas + dispatcher + agentic loop for the chat assistant
+├── .github/workflows/
+│   └── build-windows.yml     # CI: build dist/FreeFlow.exe on each tag, attach to release
+├── freeflow.spec             # PyInstaller spec used to build the Windows executable
+├── LICENSE                   # MIT license + extended disclaimer
 ├── setup.py
 ├── requirements.txt
 └── README.md                 # This file
@@ -500,8 +554,48 @@ FreeFlow/
 
 ## License
 
-Open-source — see `LICENSE` if present, otherwise treat as MIT until
-told otherwise.
+FreeFlow is released under the **MIT License**.  See
+[`LICENSE`](LICENSE) for the full text — it spells out the standard
+MIT permissions plus an explicit additional disclaimer:
+
+> The author (Stefano Angioletti-Uberti) provides this software in the
+> hope that it will be useful, but on an entirely "as-is" basis and
+> accepts **no responsibility whatsoever** for any use, misuse, error,
+> bug, data loss, or any consequence — direct or indirect — of running
+> the Software.  **You use this Software at your own risk.**
+
+Copyright © 2026 **Stefano Angioletti-Uberti** —
+[s.angioletti-uberti@imperial.ac.uk](mailto:s.angioletti-uberti@imperial.ac.uk).
+
+---
+
+## Donation
+
+FreeFlow is developed and maintained by a single person in their spare
+time — alongside a full research workload — and is given away for free
+to anyone who finds it useful.
+
+If FreeFlow saves you time, makes your figures nicer, helps a paper
+get written, or simply spares you from clicking through a commercial
+GUI for the hundredth time, please consider sending a small donation.
+**Every contribution — large or small — helps keep the software free,
+open-source, and actively maintained**, and is a meaningful recognition
+of the time and care that goes into building a tool like this.
+
+**Transfer details**
+
+> *Bank transfer (IBAN / SWIFT):* _to be filled in by the author_
+>
+> *PayPal:* _to be filled in by the author_
+>
+> *Other (e.g. GitHub Sponsors, Stripe, Wise):* _to be filled in by the author_
+
+If you'd like to donate but the option above isn't convenient for you,
+get in touch at the email above and we'll arrange something that works.
+
+Thank you for using FreeFlow.
+
+---
 
 ## Reporting issues
 

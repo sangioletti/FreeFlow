@@ -3,7 +3,7 @@ markers_window.py - Editor for fluorophore -> protein marker mappings.
 
 Opens a matplotlib popup with one row per FCS channel:
 
-    [fluorophore]  [marker text box]  [Hide / Show toggle]
+    [fluorophore]  [marker text box]  [Visible / Hidden toggle]
 
 The fluorophore is read-only; the marker is editable; the third column is
 a button that toggles whether the channel is hidden from the main window's
@@ -68,8 +68,9 @@ class MarkersWindow:
 
         channels = list(self.app.fcs.channel_names)
         n = len(channels)
-        # Figure height scales with channel count, capped to keep things sane.
-        fig_h = max(4.5, min(0.50 * n + 2.4, 13.0))
+        # Figure height scales with channel count + room for two action
+        # rows at the bottom (Reload/Save/Close + Save/Load Scheme).
+        fig_h = max(5.0, min(0.50 * n + 2.9, 13.5))
         self.fig = plt.figure("Marker Mapping", figsize=(8.5, fig_h))
         _theme.style_window(self.fig)
         self.fig.clf()
@@ -93,8 +94,9 @@ class MarkersWindow:
                       fontsize=9, fontweight="bold")
 
         # Each row's vertical span in figure-fraction coordinates.
+        # ``bottom`` reserves the two-row action panel at the foot.
         top = 0.89
-        bottom = 0.13  # leave room for the action buttons
+        bottom = 0.145
         row_h_total = (top - bottom) / max(1, n)
         row_h = min(0.045, row_h_total * 0.82)
         row_gap = max(0.001, row_h_total - row_h)
@@ -147,9 +149,12 @@ class MarkersWindow:
             self._row_textboxes[short] = tb
             self._draft[short] = initial
 
-            # Hide / Show toggle button.
+            # Visibility-state button. The button label now describes the
+            # current *state* of the channel ("Visible" or "Hidden") rather
+            # than the action that clicking will perform — clearer feedback
+            # at a glance.
             ax_hide = self.fig.add_axes([x_hide_l, y, x_hide_r - x_hide_l, row_h])
-            btn_label = "Show" if is_hidden else "Hide"
+            btn_label = "Hidden" if is_hidden else "Visible"
             btn = Button(ax_hide, btn_label)
             try:
                 btn.label.set_fontsize(8)
@@ -158,25 +163,47 @@ class MarkersWindow:
             btn.on_clicked(self._make_on_hide_toggle(short))
             self._row_hide_buttons[short] = btn
 
-        # Action buttons (bottom strip).
+        # Action buttons — two rows of three.  The top row keeps the
+        # existing sidecar-style actions (Reload / Save / Close); the
+        # bottom row holds the new "scheme" import/export pair.
         btn_w = 0.20
         btn_h = 0.05
-        btn_y = 0.05
         gap = 0.02
         total = btn_w * 3 + gap * 2
         start_x = (1.0 - total) / 2
 
-        ax_reload = self.fig.add_axes([start_x, btn_y, btn_w, btn_h])
+        btn_y_top = 0.075
+        ax_reload = self.fig.add_axes([start_x, btn_y_top, btn_w, btn_h])
         self.btn_reload = Button(ax_reload, "Reload from FCS")
         self.btn_reload.on_clicked(self._on_reload)
 
-        ax_save = self.fig.add_axes([start_x + btn_w + gap, btn_y, btn_w, btn_h])
+        ax_save = self.fig.add_axes(
+            [start_x + btn_w + gap, btn_y_top, btn_w, btn_h]
+        )
         self.btn_save = Button(ax_save, "Save")
         self.btn_save.on_clicked(self._on_save)
 
-        ax_close = self.fig.add_axes([start_x + 2 * (btn_w + gap), btn_y, btn_w, btn_h])
+        ax_close = self.fig.add_axes(
+            [start_x + 2 * (btn_w + gap), btn_y_top, btn_w, btn_h]
+        )
         self.btn_close = Button(ax_close, "Close")
         self.btn_close.on_clicked(self._on_close_clicked)
+
+        # New: Save Scheme... / Load Scheme... — write or read the full
+        # marker + hidden-channel scheme to / from an arbitrary file
+        # path so users can reuse a scheme across FCS files.
+        btn_y_bot = 0.015
+        two_total = btn_w * 2 + gap
+        two_start = (1.0 - two_total) / 2
+        ax_save_scheme = self.fig.add_axes([two_start, btn_y_bot, btn_w, btn_h])
+        self.btn_save_scheme = Button(ax_save_scheme, "Save Scheme...")
+        self.btn_save_scheme.on_clicked(self._on_save_scheme)
+
+        ax_load_scheme = self.fig.add_axes(
+            [two_start + btn_w + gap, btn_y_bot, btn_w, btn_h]
+        )
+        self.btn_load_scheme = Button(ax_load_scheme, "Load Scheme...")
+        self.btn_load_scheme.on_clicked(self._on_load_scheme)
 
         # Theme: section headers in accent navy + style every button + textbox.
         for txt in list(self.fig.texts):
@@ -186,6 +213,7 @@ class MarkersWindow:
             except Exception:
                 pass
         for btn in (self.btn_reload, self.btn_save, self.btn_close,
+                    self.btn_save_scheme, self.btn_load_scheme,
                     *self._row_hide_buttons.values()):
             _theme.style_button(btn)
         for tb in self._row_textboxes.values():
@@ -244,7 +272,7 @@ class MarkersWindow:
         btn = self._row_hide_buttons.get(short)
         if btn is not None:
             try:
-                btn.label.set_text("Show" if is_hidden else "Hide")
+                btn.label.set_text("Hidden" if is_hidden else "Visible")
             except Exception:
                 pass
 
@@ -310,6 +338,97 @@ class MarkersWindow:
             self.app._y_idx = (
                 visible_idxs[1] if len(visible_idxs) > 1 else visible_idxs[0]
             )
+
+    # ----------------------------------------------------------------- #
+    #  Save / Load Scheme — write or read the marker+hidden mapping to a
+    #  user-chosen JSON file, so a scheme can be shared across FCS files.
+    # ----------------------------------------------------------------- #
+    def _on_save_scheme(self, event):
+        if self.app.fcs is None:
+            return
+        from pathlib import Path
+        # Suggest "<panel-name>.scheme.json" as the default filename.
+        default_name = f"{Path(self.app.fcs.filepath).stem}.scheme.json"
+        path = self.app._ask_save_path(
+            default_name=default_name,
+            filetypes=[("Marker scheme (JSON)", "*.json"),
+                       ("All files", "*.*")],
+            default_ext=".json",
+            title="Save Marker Scheme",
+        )
+        if not path:
+            self.app._log("Save Scheme cancelled")
+            return
+        # Collect the current edits + the hidden draft and write them
+        # to the chosen path via the same save_markers writer used by
+        # the sidecar flow.
+        new_map = self._collect_current_drafts()
+        non_empty = {k: v for k, v in new_map.items() if v}
+        try:
+            written = save_markers(
+                self.app.fcs.filepath,
+                non_empty,
+                fcs=self.app.fcs,
+                hidden=self._hidden_draft,
+                path_override=path,
+            )
+        except OSError as e:
+            self.app._log(f"Save Scheme failed: {e}")
+            return
+        import os
+        self.app._log(f"Saved marker scheme → {os.path.basename(written or path)}")
+
+    def _on_load_scheme(self, event):
+        if self.app.fcs is None:
+            return
+        path = self.app._ask_open_path(
+            filetypes=[("Marker scheme (JSON)", "*.json"),
+                       ("All files", "*.*")],
+            title="Load Marker Scheme",
+        )
+        if not path:
+            self.app._log("Load Scheme cancelled")
+            return
+        import os
+        if not os.path.exists(path):
+            self.app._log(f"Load Scheme: file not found ({path})")
+            return
+        try:
+            loaded_map = load_markers(
+                self.app.fcs.filepath, self.app.fcs, path_override=path,
+            )
+            loaded_hidden = load_hidden_channels(
+                self.app.fcs.filepath, path_override=path,
+            )
+        except Exception as e:
+            self.app._log(f"Load Scheme failed: {e}")
+            return
+
+        # Apply the loaded scheme to the in-window draft so the user
+        # can review (and click Save) before it touches the canonical
+        # sidecar / the main plot.
+        loaded_count = 0
+        for short, tb in self._row_textboxes.items():
+            new_val = loaded_map.get(short, "")
+            try:
+                tb.set_val(new_val)
+            except Exception:
+                pass
+            self._draft[short] = new_val
+            if new_val:
+                loaded_count += 1
+        # Only mark channels hidden that exist in this FCS file.
+        valid_hidden = {s for s in loaded_hidden
+                        if s in self.app.fcs.channel_names}
+        self._hidden_draft = valid_hidden
+        for short in self.app.fcs.channel_names:
+            self._refresh_row_appearance(short)
+        self.app._log(
+            f"Loaded marker scheme from {os.path.basename(path)} "
+            f"({loaded_count} marker(s), {len(valid_hidden)} hidden) — "
+            "click Save to commit."
+        )
+        self.fig.canvas.draw_idle()
 
     def _on_reload(self, event):
         """Revert TextBoxes to FCS-PnS defaults and un-hide every channel."""
