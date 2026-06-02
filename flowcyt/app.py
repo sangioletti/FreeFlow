@@ -1938,7 +1938,7 @@ class FlowCytApp:
                       "shift+left", "shift+right", "shift+up", "shift+down"}
         direction = event.key.replace("shift+", "") if event.key in arrow_keys else None
         fine = event.key.startswith("shift+") if event.key in arrow_keys else False
-        scale = 1.0 / 3.0 if fine else 1.0
+        scale = 1.0 / 5.0 if fine else 1.0
 
         # Arrow keys in Translate mode — all 4 directions move the gate
         if self._mode == MODE_TRANSLATE and self._handle_selected_gate is not None:
@@ -4189,7 +4189,7 @@ class GateWindow:
                       "shift+left", "shift+right", "shift+up", "shift+down"}
         direction = event.key.replace("shift+", "") if event.key in arrow_keys else None
         fine = event.key.startswith("shift+") if event.key in arrow_keys else False
-        scale = 1.0 / 3.0 if fine else 1.0
+        scale = 1.0 / 5.0 if fine else 1.0
 
         # Arrow keys in Translate mode — all 4 directions
         if self._mode == MODE_TRANSLATE and self._handle_selected_gate is not None:

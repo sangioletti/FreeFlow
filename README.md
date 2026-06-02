@@ -399,7 +399,7 @@ doesn't silently flip the axis back to linear.
 | **Tab** | Cycle to the next control point |
 | **← / →** | Nudge the selected point left / right (constant step in log space when X is log) |
 | **↑ / ↓** | Nudge the selected point up / down (constant step in log space when Y is log) |
-| **Shift + arrows** | Bigger nudge (5×) |
+| **Shift + arrows** | Finer nudge (1/5 of the normal step) — useful for precise positioning |
 
 ### In any text input field (Mac)
 
