@@ -100,34 +100,70 @@ channel list, you're good.
 
 ### Building the Windows executable from source
 
-The repository ships a PyInstaller specification (`freeflow.spec`) that
-bundles the whole app — Python interpreter, NumPy, matplotlib, Qt, the
-DeepSeek client — into one standalone `FreeFlow.exe`.
+The repository ships a PyInstaller specification (`freeflow.spec`)
+plus a convenience batch script (`build_windows.bat`) that bundles the
+whole app — Python interpreter, NumPy, matplotlib, Qt, the DeepSeek
+client — into one standalone `FreeFlow.exe`.
 
 On a Windows machine:
 
 ```powershell
-# One-time setup
+# One-command path — just runs the lines below for you
+.\build_windows.bat
+
+# Manual path
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install PyQt5 pyinstaller
-
-# Build
 pyinstaller --clean --noconfirm freeflow.spec
-
-# Run
 .\dist\FreeFlow.exe
 ```
 
 This typically produces a `~50–80 MB` single file.  No installation,
 no PATH changes — copy `dist\FreeFlow.exe` anywhere and double-click.
 
-The build also runs automatically on the project's CI: every Git tag
-of the form `vX.Y.Z` triggers
-`.github/workflows/build-windows.yml`, which produces a fresh
-`FreeFlow.exe` on a Windows runner and attaches it to the matching
-GitHub Release. End users just download the file from the Releases
-page — no compilation needed on their side.
+### CI build & "I made a release but the .exe didn't appear"
+
+`.github/workflows/build-windows.yml` builds `FreeFlow.exe` on every
+`vX.Y.Z` tag push, every release published via the GitHub UI, and on
+manual workflow dispatch. The built `.exe` is attached to the matching
+release page so end users can download it directly.
+
+If you created a release and the `.exe` didn't show up, walk through
+this checklist — these are the three things that bite people:
+
+1. **Check the Actions tab on GitHub.** The workflow should appear
+   under *Build Windows executable* with the run that corresponds to
+   your release.  If no run appears at all, jump to step 2 or 3.  If a
+   run is there but red, click into it — the most common failure is a
+   PyInstaller issue surfaced in the *Build FreeFlow.exe* step, or a
+   `Resource not accessible by integration` error in the *Attach…*
+   step (the permissions fix is already in the workflow, but a fork
+   may strip it).
+2. **`GITHUB_TOKEN` permissions.** On repos created after February
+   2023, the default token is read-only.  The workflow now declares
+   `permissions: contents: write` at the job level, but if you've also
+   set repo-wide *Settings → Actions → General → Workflow permissions*
+   to "Read repository contents and packages permissions", flip it to
+   *Read and write permissions*.  Without write access, the upload
+   step silently fails and the `.exe` never appears on the release.
+3. **The tagged commit didn't include the workflow file.** Actions
+   only sees a workflow file if it's present at the commit being
+   built.  If you tagged a commit older than the one that added
+   `build-windows.yml`, no run is queued.  Fix: either re-tag a newer
+   commit, or trigger the workflow manually from the *Actions* tab via
+   *workflow_dispatch* (input the release tag in the form) — it'll
+   build the binary against the current `main` and attach it.
+
+If CI is still misbehaving you always have the local fallback:
+
+```powershell
+.\build_windows.bat
+# then drag dist\FreeFlow.exe onto the release page in the GitHub UI
+```
+
+The script does exactly what the CI does, so the resulting `.exe`
+is identical.
 
 ---
 
@@ -544,6 +580,7 @@ FreeFlow/
 ├── .github/workflows/
 │   └── build-windows.yml     # CI: build dist/FreeFlow.exe on each tag, attach to release
 ├── freeflow.spec             # PyInstaller spec used to build the Windows executable
+├── build_windows.bat         # One-click local Windows build script (calls pyinstaller)
 ├── LICENSE                   # MIT license + extended disclaimer
 ├── setup.py
 ├── requirements.txt
