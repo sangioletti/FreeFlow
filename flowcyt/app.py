@@ -402,13 +402,20 @@ class FlowCytApp:
         self.btn_clear.on_clicked(lambda e: self._on_clear_gates())
         y_cur -= btn_h + btn_gap
 
-        self.ax_btn_save = self.fig.add_axes([button_x, y_cur, ctrl_w, btn_h])
-        self.btn_save = Button(self.ax_btn_save, "Save Plot...")
+        # --- Save Plot / Save All Plots buttons (side-by-side) ---
+        half_w_pair = ctrl_w / 2 - 0.005
+        self.ax_btn_save = self.fig.add_axes([button_x, y_cur, half_w_pair, btn_h])
+        self.btn_save = Button(self.ax_btn_save, "Save Plot")
         self.btn_save.on_clicked(lambda e: self._on_save_plot())
+
+        self.ax_btn_save_all = self.fig.add_axes(
+            [button_x + half_w_pair + 0.01, y_cur, half_w_pair, btn_h]
+        )
+        self.btn_save_all = Button(self.ax_btn_save_all, "Save All")
+        self.btn_save_all.on_clicked(lambda e: self._on_save_all_plots())
         y_cur -= btn_h + btn_gap
 
         # --- Save Gates / Load Gates buttons (side-by-side) ---
-        half_w_pair = ctrl_w / 2 - 0.005
         self.ax_btn_save_gates = self.fig.add_axes([button_x, y_cur, half_w_pair, btn_h])
         self.btn_save_gates = Button(self.ax_btn_save_gates, "Save Gates")
         self.btn_save_gates.on_clicked(lambda e: self._on_save_gates())
@@ -498,7 +505,7 @@ class FlowCytApp:
             "btn_xscale", "btn_yscale", "btn_viewmode",
             "btn_scandir", "btn_summary", "btn_export",
             "btn_rename", "btn_remove", "btn_clear", "btn_save",
-            "btn_save_gates", "btn_load_gates",
+            "btn_save_all", "btn_save_gates", "btn_load_gates",
             "btn_chat", "btn_markers",
         ):
             _theme.style_button(getattr(self, btn_name, None))
@@ -1607,6 +1614,11 @@ class FlowCytApp:
                                               quadrant_stats=qstats)
 
             self.ax_main.set_navigate(True)
+            # Enforce readable font sizes on all axis elements
+            self.ax_main.xaxis.label.set_fontsize(14)
+            self.ax_main.yaxis.label.set_fontsize(14)
+            self.ax_main.title.set_fontsize(14)
+            self.ax_main.tick_params(axis="both", labelsize=12)
             self._refresh_stats()
             self._refresh_parent_selector()
         except Exception as exc:
@@ -3123,6 +3135,10 @@ class FlowCytApp:
                 f"  warning: {len(missing)} gate(s) reference channels not in this "
                 f"FCS file ({', '.join(missing[:5])}{'…' if len(missing) > 5 else ''})"
             )
+        # Open a sub-window for every loaded gate, matching the behaviour
+        # the user would get when drawing each gate interactively.
+        for gate in self.gate_mgr.gates:
+            self._open_gate_window(gate)
 
     def _on_show_summary(self):
         if self.fcs is None:
@@ -3360,6 +3376,104 @@ class FlowCytApp:
         except Exception as exc:
             self._log(f"Save error: {exc}")
 
+    def _on_save_all_plots(self):
+        """Save the main plot and every open gate-window plot in one action.
+
+        The user picks a folder, and all images are saved there with
+        descriptive filenames incorporating the gate name and the current
+        axis channels so nothing gets overwritten.
+        """
+        if self.fcs is None:
+            self._log("No file loaded")
+            return
+
+        folder = self._ask_directory(title="Choose folder for plots")
+        if not folder:
+            self._log("Save all cancelled")
+            return
+
+        safe = lambda s: (
+            s.replace("/", "-").replace("\\", "-").replace(" ", "_")
+             .replace(":", "-").replace("*", "").replace("?", "")
+             .replace("\"", "").replace("<", "").replace(">", "").replace("|", "")
+        )
+        fcs_stem = safe(Path(self._fcs_files[self._fcs_file_idx]).stem
+                        if self._fcs_files and self._fcs_file_idx >= 0 else "plot")
+        saved = 0
+        folder_path = Path(folder)
+
+        # 1) Save the main window plot
+        xi, yi, xn, yn = self._current_xy()
+        suffix = f"_{safe(xn)}_vs_{safe(yn)}" if self._view_mode == "2D" else f"_{safe(xn)}_1D"
+        main_name = folder_path / f"{fcs_stem}_main{suffix}.png"
+        try:
+            self._save_axes_to_file(self.fig, self.ax_main, str(main_name))
+            self._log(f"Saved main plot → {main_name.name}")
+            saved += 1
+        except Exception as exc:
+            self._log(f"Error saving main plot: {exc}")
+
+        # 2) Save every open gate sub-window
+        dead = []
+        for uid, gw in self._gate_windows.items():
+            try:
+                if not plt.fignum_exists(gw.fig.number):
+                    dead.append(uid)
+                    continue
+            except Exception:
+                dead.append(uid)
+                continue
+
+            gxi, gyi, gxn, gyn = gw._current_xy()
+            gw_suffix = (f"_{safe(gxn)}_vs_{safe(gyn)}"
+                         if gw._view_mode == "2D" else f"_{safe(gxn)}_1D")
+            gate_name = safe(gw.gate.name)
+            fname = folder_path / f"{fcs_stem}_{gate_name}{gw_suffix}.png"
+            try:
+                self._save_axes_to_file(gw.fig, gw.ax, str(fname))
+                self._log(f"Saved [{gw.gate.name}] → {fname.name}")
+                saved += 1
+            except Exception as exc:
+                self._log(f"Error saving [{gw.gate.name}]: {exc}")
+
+        for uid in dead:
+            del self._gate_windows[uid]
+        self._log(f"Saved {saved} plot(s) to {folder}")
+
+    @staticmethod
+    def _ask_directory(title: str = "Choose Folder") -> str | None:
+        """Open a native folder-picker dialog.  Returns path or ``None``."""
+        backend = matplotlib.get_backend().lower()
+        if "qt" in backend:
+            try:
+                from matplotlib.backends.qt_compat import QtWidgets
+                app_qt = QtWidgets.QApplication.instance()
+                if app_qt is None:
+                    app_qt = QtWidgets.QApplication([])
+                path = QtWidgets.QFileDialog.getExistingDirectory(
+                    None, title,
+                )
+                return path or None
+            except Exception:
+                pass
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+            path = filedialog.askdirectory(title=title)
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return path or None
+        except Exception:
+            return None
+
     def _on_export_csv(self):
         """Export gated events to CSV - saves directly to workspace folder."""
         if self.fcs is None:
@@ -3395,14 +3509,7 @@ class FlowCytApp:
 
                 total_rows = 0
                 for gate_idx, gate in enumerate(self.gate_mgr.gates, 1):
-                    try:
-                        xi = self.fcs.channel_names.index(gate.x_channel)
-                        yi = self.fcs.channel_names.index(gate.y_channel)
-                    except ValueError:
-                        self._log(f"⚠ Skipping {gate.name}: channels not found")
-                        continue
-
-                    mask = gate.contains(self.fcs.data[:, xi], self.fcs.data[:, yi])
+                    mask = self._get_gate_mask(gate)
                     gate_count = 0
                     for idx in np.where(mask)[0]:
                         writer.writerow(
@@ -3553,29 +3660,99 @@ class FlowCytApp:
         col = self.fcs.data[:, idx]
         return float(np.min(col)), float(np.max(col))
 
-    def export_csv(self, filepath: str | None = None) -> str:
-        """Programmatic CSV export used by the chat tool. Returns the path."""
+    def _get_gate_mask(self, gate) -> np.ndarray:
+        """Return a boolean mask for *gate* that includes parent gating.
+
+        Walks up the parent hierarchy so child gates only include events
+        that also pass through every ancestor gate.
+        """
+        fcs = self.fcs
+        try:
+            xi = fcs.channel_names.index(gate.x_channel)
+            yi = fcs.channel_names.index(gate.y_channel)
+        except ValueError:
+            return np.zeros(fcs.num_events, dtype=bool)
+
+        mask = gate.contains(fcs.data[:, xi], fcs.data[:, yi])
+
+        # Walk up the parent chain.
+        current = gate
+        while current.parent_gate_uid:
+            parent = next(
+                (g for g in self.gate_mgr.gates
+                 if g.uid == current.parent_gate_uid), None,
+            )
+            if parent is None:
+                break
+            try:
+                pxi = fcs.channel_names.index(parent.x_channel)
+                pyi = fcs.channel_names.index(parent.y_channel)
+                mask = mask & parent.contains(fcs.data[:, pxi], fcs.data[:, pyi])
+            except ValueError:
+                break
+            current = parent
+        return mask
+
+    def _default_export_dir(self) -> Path:
+        """Return a writable directory for auto-generated exports.
+
+        Prefers the directory containing the FCS file (the user clearly
+        has write access there since they opened the file from it).
+        Falls back to the package root, then the current working directory.
+        """
+        if self.fcs is not None:
+            fcs_dir = Path(self.fcs.filepath).parent
+            if os.access(str(fcs_dir), os.W_OK):
+                return fcs_dir
+        pkg_root = Path(__file__).parent.parent
+        if os.access(str(pkg_root), os.W_OK):
+            return pkg_root
+        return Path.cwd()
+
+    def export_csv(self, filepath: str | None = None,
+                   gate_name: str | None = None) -> str:
+        """Programmatic CSV export used by the chat tool.  Returns the path.
+
+        If *gate_name* is given, only events inside that specific gate are
+        exported (respecting parent hierarchy).  Otherwise every gate's
+        events are written.
+        """
         if self.fcs is None:
             raise ValueError("No FCS file loaded.")
         if not self.gate_mgr.gates:
             raise ValueError("Define at least one gate first.")
+
+        # Resolve the subset of gates to export.
+        if gate_name is not None:
+            target = self.find_gate_by_name(gate_name)
+            if target is None:
+                raise ValueError(
+                    f"No gate named '{gate_name}'.  "
+                    f"Known gates: {', '.join(g.name for g in self.gate_mgr.gates)}"
+                )
+            gates_to_export = [target]
+        else:
+            gates_to_export = list(self.gate_mgr.gates)
+
         if filepath is None:
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base = Path(self.fcs.filepath).stem
-            filepath = str(
-                Path(__file__).parent.parent / f"{base}_gated_{timestamp}.csv"
+            suffix = f"_{gate_name}" if gate_name else ""
+            safe = lambda s: (
+                s.replace("/", "-").replace("\\", "-").replace(" ", "_")
+                 .replace(":", "-").replace("*", "").replace("?", "")
+                 .replace("\"", "").replace("<", "").replace(">", "")
+                 .replace("|", "")
             )
+            filename = f"{safe(base)}{safe(suffix)}_gated_{timestamp}.csv"
+            filepath = str(self._default_export_dir() / filename)
+
         with open(filepath, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["gate", "event_idx"] + self.fcs.channel_names)
-            for gate in self.gate_mgr.gates:
-                try:
-                    xi = self.fcs.channel_names.index(gate.x_channel)
-                    yi = self.fcs.channel_names.index(gate.y_channel)
-                except ValueError:
-                    continue
-                mask = gate.contains(self.fcs.data[:, xi], self.fcs.data[:, yi])
+            for gate in gates_to_export:
+                mask = self._get_gate_mask(gate)
                 for idx in np.where(mask)[0]:
                     writer.writerow(
                         [gate.name, int(idx)] + self.fcs.data[idx].tolist()
@@ -3781,6 +3958,11 @@ class GateWindow:
         ax_save = self.fig.add_axes([rs, y_cur, cw, btn_h])
         self._btn_save = Button(ax_save, "Save Plot...")
         self._btn_save.on_clicked(lambda e: self._on_save_plot())
+
+        y_cur -= btn_h + btn_gap
+        ax_export = self.fig.add_axes([rs, y_cur, cw, btn_h])
+        self._btn_export_csv = Button(ax_export, "Export CSV")
+        self._btn_export_csv.on_clicked(lambda e: self._on_export_csv())
 
         # Stats panel (fills remaining space)
         y_cur -= 0.01
@@ -4125,7 +4307,15 @@ class GateWindow:
                         lbl = f"{g.name}\n{s['percent_of_total']:.1f}% total | {s['percent']:.1f}% parent"
                     else:
                         lbl = g.name
-                    draw_gate_overlay(self.ax, g, label_text=lbl)
+                    qstats = s.get("quadrant_breakdown") if s else None
+                    draw_gate_overlay(self.ax, g, label_text=lbl,
+                                      quadrant_stats=qstats)
+
+        # Enforce readable font sizes on all axis elements
+        self.ax.xaxis.label.set_fontsize(14)
+        self.ax.yaxis.label.set_fontsize(14)
+        self.ax.title.set_fontsize(14)
+        self.ax.tick_params(axis="both", labelsize=12)
 
         # Stats panel
         self.ax_stats.clear()
@@ -4156,10 +4346,11 @@ class GateWindow:
                 except ValueError:
                     info += f"  {cg.name}: (channels n/a)\n"
         elif count > 0:
-            info += "\nMedians:\n"
+            info += "\n{:<20s} {:>10s} {:>10s}\n".format("Channel", "MedFI", "MFI")
             for ci, ch in enumerate(fcs.channel_names):
                 med = float(np.median(gated_data[:, ci]))
-                info += f"  {ch}: {med:.1f}\n"
+                mn = float(np.mean(gated_data[:, ci]))
+                info += f"  {ch:<18s} {med:>10.1f} {mn:>10.1f}\n"
 
         self.ax_stats.text(0.05, 0.95, info, fontsize=6.5, family="monospace",
                            va="top", transform=self.ax_stats.transAxes,
@@ -4982,6 +5173,53 @@ class GateWindow:
             self.app._log(f"[{self.gate.name}] Plot saved to {fpath}")
         except Exception as exc:
             self.app._log(f"[{self.gate.name}] Save error: {exc}")
+
+    def _on_export_csv(self):
+        """Export events inside this gate to a CSV file."""
+        fcs = self.app.fcs
+        if fcs is None:
+            self.app._log(f"[{self.gate.name}] No file loaded")
+            return
+
+        mask = self._get_mask()
+        count = int(mask.sum())
+        if count == 0:
+            self.app._log(f"[{self.gate.name}] No events in gate — nothing to export")
+            return
+
+        safe = lambda s: (
+            s.replace("/", "-").replace("\\", "-").replace(" ", "_")
+             .replace(":", "-").replace("*", "").replace("?", "")
+             .replace("\"", "").replace("<", "").replace(">", "").replace("|", "")
+        )
+        fcs_stem = Path(fcs.filepath).stem
+        default_name = f"{safe(fcs_stem)}_{safe(self.gate.name)}.csv"
+
+        path = FlowCytApp._ask_save_path(
+            default_name=default_name,
+            filetypes=[("CSV file", "*.csv"), ("All files", "*.*")],
+            default_ext=".csv",
+            title=f"Export CSV ({self.gate.name})",
+        )
+        if not path:
+            self.app._log(f"[{self.gate.name}] Export cancelled")
+            return
+        fpath = Path(path)
+        if not fpath.suffix:
+            fpath = fpath.with_suffix(".csv")
+
+        try:
+            gated = fcs.data[mask]
+            with open(str(fpath), "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(fcs.channel_names)
+                for row in gated:
+                    writer.writerow(row.tolist())
+            self.app._log(
+                f"[{self.gate.name}] Exported {count:,} events to {fpath.name}"
+            )
+        except Exception as exc:
+            self.app._log(f"[{self.gate.name}] Export error: {exc}")
 
     def _on_remove_gate(self):
         """Remove a child gate created in this window."""

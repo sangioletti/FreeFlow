@@ -271,13 +271,14 @@ def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0,
             py = (my + cy) / 2.0
 
         is_selected = (q == gate.quadrant)
-        text = f"{q}: {s.get('count', 0):,}  ({s.get('percent', 0.0):.1f}%)"
+        sel_marker = " *" if is_selected else ""
+        text = f"{q}: {s.get('count', 0):,}  ({s.get('percent', 0.0):.1f}%){sel_marker}"
         txt = ax.text(
             px, py, text,
             ha="center", va="center",
-            fontsize=9 if is_selected else 8,
+            fontsize=10 if is_selected else 9,
             fontweight="bold" if is_selected else "normal",
-            color=gate.color if is_selected else "#333333",
+            color=gate.color,
         )
         txt.set_path_effects(_LABEL_OUTLINE)
 

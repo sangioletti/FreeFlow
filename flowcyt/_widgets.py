@@ -38,6 +38,29 @@ from matplotlib.widgets import (
 _DEBOUNCE_S = 0.08
 
 
+def _copy_to_clipboard(text: str) -> None:
+    """Write *text* to the system clipboard (best effort, no exceptions)."""
+    import subprocess
+    if sys.platform == "darwin":
+        cmd = ["pbcopy"]
+    else:
+        # Linux: try xclip first, then xsel
+        cmd = ["xclip", "-selection", "clipboard"]
+    try:
+        subprocess.run(cmd, input=text, text=True, check=False, timeout=2.0)
+    except FileNotFoundError:
+        if sys.platform != "darwin":
+            try:
+                subprocess.run(
+                    ["xsel", "--clipboard", "--input"],
+                    input=text, text=True, check=False, timeout=2.0,
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _make_debouncer():
     """Returns a callable that returns True if the caller should be blocked
     (i.e. fired within ``_DEBOUNCE_S`` of the last firing).
@@ -368,6 +391,12 @@ class _MacTextBox(_MplTextBox):
             # "select all" by moving the cursor to the end so the next
             # typed character begins a fresh insertion at the tail.
             return self._mac_with_key(event, "end")
+        if key == "mod+c":
+            self._mac_copy_clipboard()
+            return
+        if key == "mod+x":
+            self._mac_cut_clipboard()
+            return
         if key == "mod+v":
             self._mac_paste_clipboard()
             return
@@ -464,6 +493,20 @@ class _MacTextBox(_MplTextBox):
             self._rendercursor()
         except Exception:
             pass
+
+    def _mac_copy_clipboard(self):
+        """Copy the full input text to the system clipboard."""
+        text = self.text or ""
+        if not text:
+            return
+        _copy_to_clipboard(text)
+
+    def _mac_cut_clipboard(self):
+        """Cut: copy the full input text to clipboard, then clear."""
+        text = self.text or ""
+        if text:
+            _copy_to_clipboard(text)
+        self._mac_clear_all()
 
     def _mac_paste_clipboard(self):
         try:

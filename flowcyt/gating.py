@@ -374,7 +374,7 @@ class GateManager:
         Return per-gate statistics with parent-child hierarchy.
 
         Each dict contains:
-          name, uid, color, count, percent, medians (per channel),
+          name, uid, color, count, percent, medians, means (per channel),
           parent_uid (for hierarchical display)
         """
         total = len(data)
@@ -430,11 +430,14 @@ class GateManager:
                             gate.name, f"{count:,}", f"{total:,}", pct)
 
             medians = {}
+            means = {}
             for ci, ch in enumerate(channel_names):
                 if count > 0:
                     medians[ch] = float(np.median(data[mask, ci]))
+                    means[ch] = float(np.mean(data[mask, ci]))
                 else:
                     medians[ch] = 0.0
+                    means[ch] = 0.0
 
             pct_of_total = 100.0 * count / total if total else 0.0
             entry = {
@@ -447,6 +450,7 @@ class GateManager:
                 "percent_of_total": pct_of_total,  # always % of all events
                 "parent_count": parent_count,
                 "medians": medians,
+                "means": means,
                 "parent_uid": gate.parent_gate_uid,
             }
 

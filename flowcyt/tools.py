@@ -350,13 +350,17 @@ def _destructive_tools() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "export_csv",
-                "description": "Export the gated events to a CSV file. Requires confirmation if the target file would be overwritten.",
+                "description": "Export gated events to a CSV file. If gate_name is given, only that specific gate's events are exported (respecting parent hierarchy). If gate_name is omitted, all gates are exported. Requires confirmation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "gate_name": {
+                            "type": ["string", "null"],
+                            "description": "Name of a specific gate to export. If omitted or null, all gates are exported.",
+                        },
                         "filepath": {
                             "type": ["string", "null"],
-                            "description": "Optional output path. If omitted, uses the auto-generated path next to the FCS file.",
+                            "description": "Optional output path. If omitted, an auto-generated path next to the FCS file is used.",
                         },
                     },
                 },
@@ -686,7 +690,12 @@ def _tool_clear_all_gates(app, args):
 
 def _tool_export_csv(app, args):
     filepath = args.get("filepath") or None
-    path = app.export_csv(filepath)
+    gate_name = args.get("gate_name") or None
+    if gate_name in ("", "null", "None"):
+        gate_name = None
+    path = app.export_csv(filepath=filepath, gate_name=gate_name)
+    if gate_name:
+        return f"Exported events from gate '{gate_name}' to {path}."
     return f"Exported gated events to {path}."
 
 
@@ -873,5 +882,7 @@ def _describe_destructive(name: str, args: dict) -> str:
         return "Delete every defined gate."
     if name == "export_csv":
         fp = args.get("filepath")
-        return f"Export gated events to {fp or 'auto-generated path'}."
+        gn = args.get("gate_name")
+        gate_str = f" for gate '{gn}'" if gn else " for all gates"
+        return f"Export gated events{gate_str} to {fp or 'auto-generated path'}."
     return f"Execute destructive action: {name}({args})"

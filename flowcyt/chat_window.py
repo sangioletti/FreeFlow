@@ -20,7 +20,7 @@ import textwrap
 
 import matplotlib.pyplot as plt
 
-from ._widgets import Button, TextBox, install_tk_click_bridge  # macOS-friendly variants
+from ._widgets import Button, TextBox, install_tk_click_bridge, _copy_to_clipboard  # macOS-friendly variants
 from . import theme as _theme
 from . import tools as tools_mod
 from .llm import (
@@ -176,6 +176,10 @@ class ChatWindow:
             transform=self._ax_header.transAxes,
         )
 
+        ax_copy = self.fig.add_axes([0.72, 0.935, 0.12, 0.04])
+        self.btn_copy = Button(ax_copy, "Copy Chat")
+        self.btn_copy.on_clicked(lambda _e: self._copy_transcript())
+
         ax_refresh = self.fig.add_axes([0.85, 0.935, 0.12, 0.04])
         self.btn_refresh = Button(ax_refresh, "Refresh $")
         self.btn_refresh.on_clicked(lambda _e: self._refresh_balance())
@@ -216,6 +220,7 @@ class ChatWindow:
                 except Exception:
                     pass
         _theme.style_button(self.btn_send)
+        _theme.style_button(getattr(self, "btn_copy", None))
         _theme.style_button(getattr(self, "btn_refresh", None))
         _theme.style_textbox(self._textbox)
         if getattr(self, "_ax_history", None) is not None:
@@ -247,6 +252,7 @@ class ChatWindow:
         self._confirm_yes_btn = None
         self._confirm_no_btn = None
 
+        self._install_tk_keyboard_bridge()
         self._render_history()
 
     def _seed_welcome(self):
@@ -554,6 +560,79 @@ class ChatWindow:
         self._confirm_result = value
         try:
             self.fig.canvas.stop_event_loop()
+        except Exception:
+            pass
+
+    # ----------------------------------------------------------------- #
+    #  Copy transcript
+    # ----------------------------------------------------------------- #
+    def _copy_transcript(self):
+        """Copy the entire chat transcript to the system clipboard."""
+        lines: list[str] = []
+        for ev in self._events:
+            kind = ev.get("kind", "info")
+            if kind == "tool_result" and ev.get("is_error"):
+                kind = "tool_error"
+            label, _color = _STYLE.get(kind, _STYLE["info"])
+            content = self._format_event_content(ev)
+            lines.append(f"[{label}] {content}")
+        text = "\n\n".join(lines)
+        _copy_to_clipboard(text)
+        self._set_status("Copied transcript to clipboard")
+
+    # ----------------------------------------------------------------- #
+    #  Tk-level Cmd+C / Cmd+V keyboard bridge (macOS)
+    # ----------------------------------------------------------------- #
+    def _install_tk_keyboard_bridge(self):
+        """Bind Cmd+C and Cmd+V at the Tk level so the events reliably
+        reach matplotlib's ``key_press_event`` handler on macOS.
+
+        Without this, the system or Tk framework can silently swallow
+        Cmd-based shortcuts before matplotlib sees them.
+        """
+        import sys as _sys
+        if _sys.platform != "darwin":
+            return
+        canvas = getattr(self.fig, "canvas", None)
+        if canvas is None or not hasattr(canvas, "get_tk_widget"):
+            return
+        try:
+            tk_widget = canvas.get_tk_widget()
+        except Exception:
+            return
+
+        from matplotlib.backend_bases import KeyEvent
+
+        def _dispatch_key(mpl_key, tk_event):
+            try:
+                key_event = KeyEvent(
+                    "key_press_event", canvas, mpl_key, x=0, y=0,
+                )
+                canvas.callbacks.process("key_press_event", key_event)
+            except Exception:
+                pass
+            return "break"  # stop Tk propagation
+
+        try:
+            # macOS: Cmd key is <Command-…>
+            tk_widget.bind("<Command-c>",
+                           lambda e: _dispatch_key("super+c", e))
+            tk_widget.bind("<Command-v>",
+                           lambda e: _dispatch_key("super+v", e))
+            tk_widget.bind("<Command-x>",
+                           lambda e: _dispatch_key("super+x", e))
+            tk_widget.bind("<Command-a>",
+                           lambda e: _dispatch_key("super+a", e))
+            # Also bind on the toplevel window as a fallback
+            top = tk_widget.winfo_toplevel()
+            top.bind("<Command-c>",
+                     lambda e: _dispatch_key("super+c", e))
+            top.bind("<Command-v>",
+                     lambda e: _dispatch_key("super+v", e))
+            top.bind("<Command-x>",
+                     lambda e: _dispatch_key("super+x", e))
+            top.bind("<Command-a>",
+                     lambda e: _dispatch_key("super+a", e))
         except Exception:
             pass
 
