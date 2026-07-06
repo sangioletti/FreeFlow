@@ -7,11 +7,15 @@ any external dependencies beyond numpy.  Supports:
   * $DATATYPE = F (float), D (double), I (integer)
   * $MODE = L (list mode)
   * $BYTEORD = little-endian and big-endian
+  * Embedded compensation / spillover matrices ($SPILLOVER, SPILL)
 """
 
 from __future__ import annotations
 
 import struct
+import sys
+import warnings
+
 import numpy as np
 
 
@@ -97,6 +101,12 @@ class FCSData:
             # Integer: read row-by-row with heterogeneous widths
             self.data = self._read_int_data(data_raw, endian, n_par, n_events)
 
+        # ---------- Compensation (spillover) ----------
+        self.is_compensated = False
+        self.spillover_matrix: np.ndarray | None = None
+        self.spillover_channels: list[str] = []
+        self._apply_compensation()
+
     def _build_int_dtype(self, endian: str, n_par: int):
         """Build a numpy structured dtype for integer-mode data."""
         formats = []
@@ -140,6 +150,158 @@ class FCSData:
                 meta[key.upper()] = val
             i += 2
         return meta
+
+    # ------------------------------------------------------------------ #
+    #  Compensation / Spillover
+    # ------------------------------------------------------------------ #
+    def _apply_compensation(self):
+        """Detect embedded spillover matrices, validate, and compensate.
+
+        Checks the standard FCS keywords ``$SPILLOVER`` and the common
+        vendor variant ``SPILL``.  If exactly one unique matrix is found
+        the data is compensated in-place (spillover matrix inverted and
+        applied to the relevant channels).  If more than one *distinct*
+        matrix is found the programme aborts with an error.
+        """
+        # Collect all spillover keyword values present in the metadata
+        spill_keywords = ("$SPILLOVER", "SPILL")
+        found: dict[str, str] = {}  # keyword → raw value
+        for key in spill_keywords:
+            val = self.metadata.get(key)
+            if val is not None and val.strip():
+                found[key] = val.strip()
+
+        if not found:
+            return  # No compensation matrix — nothing to do
+
+        # De-duplicate by value — different keywords may carry the same matrix
+        unique_values = list(set(found.values()))
+        if len(unique_values) > 1:
+            keywords_str = ", ".join(found.keys())
+            msg = (
+                f"FATAL: Multiple distinct compensation matrices found in "
+                f"{self.filepath} (keywords: {keywords_str}).  Cannot "
+                f"determine which one to use — aborting."
+            )
+            print(f"\n{'=' * 70}", file=sys.stderr)
+            print(msg, file=sys.stderr)
+            print(f"{'=' * 70}\n", file=sys.stderr)
+            sys.exit(1)
+
+        # We have exactly one unique spillover matrix
+        source_keyword = list(found.keys())[0]
+        raw_value = unique_values[0]
+
+        try:
+            n, channel_names, matrix = self._parse_spillover(raw_value)
+        except Exception as exc:
+            warnings.warn(
+                f"Could not parse compensation matrix from {source_keyword}: "
+                f"{exc}.  Proceeding without compensation."
+            )
+            return
+
+        # Map spillover channel names to column indices in self.data
+        col_indices: list[int] = []
+        for ch in channel_names:
+            idx = self._find_channel_index(ch)
+            if idx is None:
+                warnings.warn(
+                    f"Compensation matrix references channel '{ch}' which "
+                    f"is not in the file.  Proceeding without compensation."
+                )
+                return
+            col_indices.append(idx)
+
+        # Invert the spillover matrix to obtain the compensation matrix
+        try:
+            comp_matrix = np.linalg.inv(matrix)
+        except np.linalg.LinAlgError:
+            warnings.warn(
+                "Spillover matrix is singular — cannot invert.  "
+                "Proceeding without compensation."
+            )
+            return
+
+        # Apply compensation: for each event, multiply the relevant
+        # channel values by the inverse spillover (compensation) matrix.
+        # data[:, cols] = data[:, cols] @ comp_matrix
+        subset = self.data[:, col_indices].copy()
+        self.data[:, col_indices] = subset @ comp_matrix
+
+        self.is_compensated = True
+        self.spillover_matrix = matrix
+        self.spillover_channels = list(channel_names)
+
+        # Print terminal warning so the user knows compensation was applied
+        kw_str = (
+            " & ".join(found.keys()) if len(found) > 1
+            else list(found.keys())[0]
+        )
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print(
+            f"  WARNING — Compensation matrix detected ({kw_str})",
+            file=sys.stderr,
+        )
+        print(
+            f"  {n} channels: {', '.join(channel_names)}",
+            file=sys.stderr,
+        )
+        print(
+            f"  Data has been compensated in-place.  All subsequent",
+            file=sys.stderr,
+        )
+        print(
+            f"  analyses will use the compensated values.",
+            file=sys.stderr,
+        )
+        print(f"{'=' * 70}\n", file=sys.stderr)
+
+    @staticmethod
+    def _parse_spillover(raw: str) -> tuple[int, list[str], np.ndarray]:
+        """Parse a ``$SPILLOVER`` / ``SPILL`` value string.
+
+        Format: ``n,Name1,Name2,...,NameN,S11,S12,...,SNN``
+
+        Returns (n, channel_names, matrix) where *matrix* is n×n
+        (row-major, dtype float64).
+        """
+        parts = [p.strip() for p in raw.split(",")]
+        n = int(parts[0])
+        if n <= 0:
+            raise ValueError(f"Invalid channel count in spillover: {n}")
+
+        expected_parts = 1 + n + n * n
+        if len(parts) < expected_parts:
+            raise ValueError(
+                f"Spillover string too short: expected {expected_parts} "
+                f"comma-separated values, got {len(parts)}"
+            )
+
+        channel_names = parts[1 : 1 + n]
+        coeffs = [float(v) for v in parts[1 + n : 1 + n + n * n]]
+        matrix = np.array(coeffs, dtype=np.float64).reshape(n, n)
+        return n, channel_names, matrix
+
+    def _find_channel_index(self, name: str) -> int | None:
+        """Find the column index for a channel name (case-insensitive).
+
+        Tries exact match on ``$PnN`` names first, then on labels.
+        """
+        # Exact match on short names
+        for i, ch in enumerate(self.channel_names):
+            if ch == name:
+                return i
+        # Case-insensitive match on short names
+        name_lower = name.lower()
+        for i, ch in enumerate(self.channel_names):
+            if ch.lower() == name_lower:
+                return i
+        # Match on labels
+        for i, lbl in enumerate(self.channel_labels):
+            if lbl == name or lbl.lower() == name_lower:
+                return i
+        return None
 
     # ------------------------------------------------------------------ #
     #  Convenience helpers
@@ -187,4 +349,10 @@ class FCSData:
             zip(self.channel_names, self.channel_labels)
         ):
             lines.append(f"  {i}: {n:20s}  {lbl}")
+        if self.is_compensated:
+            lines.append(
+                f"Compensation: applied ({len(self.spillover_channels)} channels)"
+            )
+        else:
+            lines.append("Compensation: none")
         return "\n".join(lines)
