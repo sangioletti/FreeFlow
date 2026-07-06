@@ -1,0 +1,40 @@
+MIT License
+
+Copyright (c) 2026 Stefano Angioletti-Uberti
+Contact: s.angioletti-uberti@imperial.ac.uk
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+
+---
+
+ADDITIONAL DISCLAIMER
+
+The author (Stefano Angioletti-Uberti) provides this software in the hope
+that it will be useful, but on an entirely "as-is" basis.  The author
+explicitly accepts no responsibility whatsoever for:
+
+  * any use, misuse, or consequence of using the Software, including but
+    not limited to incorrect scientific conclusions drawn from its output;
+  * any error, bug, defect, or omission in the code, the documentation, or
+    any auxiliary file shipped with it;
+  * any data loss, damage, or harm — direct, indirect, incidental, special,
+    consequential, or otherwise — resulting from running the Software, even
+    if the author has been advised of the possibility of such damage.
+
+You use this Software at your own risk and on your own responsibility.

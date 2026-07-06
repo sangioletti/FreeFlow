@@ -101,6 +101,19 @@ class QuadrantGate(Gate):
             return (x >= self.mid_x) & (y < self.mid_y)
         return np.zeros(len(x), dtype=bool)
 
+    def quadrant_masks(self, x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
+        """Return boolean masks for all four quadrants of this gate.
+
+        Independent of which quadrant is the "selected" one — useful for
+        rendering counts/percentages on every quadrant of the crosshair.
+        """
+        return {
+            "Q1": (x >= self.mid_x) & (y >= self.mid_y),
+            "Q2": (x <  self.mid_x) & (y >= self.mid_y),
+            "Q3": (x <  self.mid_x) & (y <  self.mid_y),
+            "Q4": (x >= self.mid_x) & (y <  self.mid_y),
+        }
+
     @property
     def vertices(self) -> list[tuple[float, float]]:
         """Quadrant gates don't have polygon vertices — return empty.
@@ -424,18 +437,40 @@ class GateManager:
                     medians[ch] = 0.0
 
             pct_of_total = 100.0 * count / total if total else 0.0
-            results.append(
-                {
-                    "name": gate.name,
-                    "uid": gate.uid,
-                    "color": gate.color,
-                    "count": count,
-                    "total": total,
-                    "percent": pct,               # % of parent (or total if no parent)
-                    "percent_of_total": pct_of_total,  # always % of all events
-                    "parent_count": parent_count,
-                    "medians": medians,
-                    "parent_uid": gate.parent_gate_uid,
-                }
-            )
+            entry = {
+                "name": gate.name,
+                "uid": gate.uid,
+                "color": gate.color,
+                "count": count,
+                "total": total,
+                "percent": pct,               # % of parent (or total if no parent)
+                "percent_of_total": pct_of_total,  # always % of all events
+                "parent_count": parent_count,
+                "medians": medians,
+                "parent_uid": gate.parent_gate_uid,
+            }
+
+            # For quadrant gates also report counts and percentages for the
+            # *other* three quadrants so the UI can render labels on every
+            # quadrant and the stats panel can list all four.
+            if isinstance(gate, QuadrantGate):
+                qmasks = gate.quadrant_masks(data[:, xi], data[:, yi])
+                if gate.parent_gate_uid and gate.parent_gate_uid in parent_masks:
+                    pm = parent_masks[gate.parent_gate_uid]
+                    qmasks = {q: (m & pm) for q, m in qmasks.items()}
+                # Denominator for "% of parent" matches what we use for the
+                # selected-quadrant percentage above.
+                denom = parent_count if parent_count else total
+                breakdown = {}
+                for q, qm in qmasks.items():
+                    qc = int(qm.sum())
+                    breakdown[q] = {
+                        "count": qc,
+                        "percent": (100.0 * qc / denom) if denom else 0.0,
+                        "percent_of_total": (100.0 * qc / total) if total else 0.0,
+                    }
+                entry["quadrant_breakdown"] = breakdown
+                entry["selected_quadrant"] = gate.quadrant
+
+            results.append(entry)
         return results

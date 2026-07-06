@@ -1,0 +1,240 @@
+name: Build cross-platform binaries
+
+# Triggers
+# --------
+#   * push.tags         — fires when ``git push origin vX.Y.Z`` adds a new tag.
+#   * release.published — fires when a release is created from the GitHub UI
+#                         (covers the "Draft a new release → Publish" flow).
+#   * workflow_dispatch — manual run from the Actions tab.  Lets you rebuild
+#                         a release after the fact by typing the tag name in
+#                         the form; the workflow will create the release if
+#                         it doesn't exist yet.
+#
+# Outputs
+# -------
+# Three downloadable artifacts (one per OS) are attached to the matching
+# GitHub Release, and also uploaded as workflow artifacts (30-day retention):
+#
+#   * Windows  →  FreeFlow-Windows.exe              (single .exe, double-click to run)
+#   * macOS    →  FreeFlow-macOS.zip                (unzip → FreeFlow.app → drag to Applications)
+#   * Linux    →  FreeFlow-Linux-x86_64.AppImage    (chmod +x → double-click)
+#
+# The macOS binary is currently Intel (built on the ``macos-13`` runner) so
+# it runs natively on Intel Macs and under Rosetta 2 on Apple Silicon.
+# Switch the matrix to ``macos-14`` if you want a native arm64 build instead.
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to attach binaries to (e.g. v1.0.0). Blank = artifact-only build."
+        required: false
+        default: ""
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+
+    # See: README "I made a release but the binaries didn't appear" section.
+    # ``contents: write`` lets ``gh release upload`` attach files to the
+    # release — without it the upload step silently fails on repos with
+    # the default read-only GITHUB_TOKEN.
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows
+            os: windows-latest
+            build_output: dist/FreeFlow.exe
+            asset_name: FreeFlow-Windows.exe
+          - label: macOS
+            os: macos-13
+            # PyInstaller's BUNDLE step produces dist/FreeFlow.app; we zip
+            # it because a .app is a directory and GitHub release assets
+            # must be single files.
+            build_output: dist/FreeFlow-macOS.zip
+            asset_name: FreeFlow-macOS.zip
+          - label: Linux
+            os: ubuntu-latest
+            build_output: dist/FreeFlow-x86_64.AppImage
+            asset_name: FreeFlow-Linux-x86_64.AppImage
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show trigger info
+        run: |
+          echo "event_name : ${{ github.event_name }}"
+          echo "ref        : ${{ github.ref }}"
+          echo "ref_name   : ${{ github.ref_name }}"
+          echo "matrix     : ${{ matrix.label }} on ${{ matrix.os }}"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install PyQt5 pyinstaller
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            libfuse2 libxcb-xinerama0 libegl1 libxkbcommon-x11-0 \
+            libdbus-1-3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0
+
+      - name: Build with PyInstaller
+        run: pyinstaller --clean --noconfirm freeflow.spec
+
+      # ---------- macOS: zip the .app produced by the BUNDLE step ----------
+      - name: Package macOS .app into zip
+        if: matrix.os == 'macos-13'
+        run: |
+          cd dist
+          if [ ! -d FreeFlow.app ]; then
+            echo "ERROR: dist/FreeFlow.app was not produced — the BUNDLE step in freeflow.spec did not run."
+            ls -la
+            exit 1
+          fi
+          # -y preserves symlinks and resource forks inside the .app
+          zip -ry FreeFlow-macOS.zip FreeFlow.app
+          ls -la FreeFlow-macOS.zip
+
+      # ---------- Linux: wrap the binary into an AppImage ------------------
+      - name: Build Linux AppImage
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Generate a 256x256 solid-colour placeholder icon using only
+          # the Python standard library (zlib + struct).  Replace this
+          # with a real freeflow.png if you commit one to the repo.
+          python <<'PY'
+          import struct, zlib
+          w = h = 256
+          r, g, b = 0x2C, 0x6B, 0xB4
+          raw = b''.join(b'\x00' + bytes([r, g, b]) * w for _ in range(h))
+          sig = b'\x89PNG\r\n\x1a\n'
+          def chunk(t, d):
+              return (struct.pack('>I', len(d)) + t + d +
+                      struct.pack('>I', zlib.crc32(t + d) & 0xffffffff))
+          ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+          idat = zlib.compress(raw)
+          with open('freeflow.png', 'wb') as f:
+              f.write(sig + chunk(b'IHDR', ihdr)
+                          + chunk(b'IDAT', idat)
+                          + chunk(b'IEND', b''))
+          PY
+
+          # Grab appimagetool (statically-linked official binary).
+          wget -q -O appimagetool \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+
+          # Build the AppDir layout that AppImage expects.
+          mkdir -p AppDir/usr/bin \
+                   AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/256x256/apps
+          cp dist/FreeFlow AppDir/usr/bin/freeflow
+          chmod +x AppDir/usr/bin/freeflow
+          cp freeflow.png AppDir/freeflow.png
+          cp freeflow.png AppDir/usr/share/icons/hicolor/256x256/apps/freeflow.png
+
+          cat > AppDir/freeflow.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=FreeFlow
+          GenericName=Flow Cytometry Viewer
+          Comment=FCS file viewer and gating tool
+          Exec=freeflow
+          Icon=freeflow
+          Categories=Science;Education;
+          Terminal=false
+          EOF
+          cp AppDir/freeflow.desktop AppDir/usr/share/applications/
+
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export PATH="${HERE}/usr/bin:${PATH}"
+          exec "${HERE}/usr/bin/freeflow" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          # appimagetool wants ``ARCH`` set for the output filename.
+          ARCH=x86_64 ./appimagetool AppDir dist/FreeFlow-x86_64.AppImage
+          ls -la dist/FreeFlow-x86_64.AppImage
+
+      # ---------- Common: verify, rename, upload ---------------------------
+      - name: Verify build output exists
+        run: |
+          if [ ! -e "${{ matrix.build_output }}" ]; then
+            echo "Missing: ${{ matrix.build_output }}"
+            ls -la dist/ || true
+            exit 1
+          fi
+          ls -la "${{ matrix.build_output }}"
+
+      - name: Rename to canonical asset name
+        run: |
+          src="${{ matrix.build_output }}"
+          dst="dist/${{ matrix.asset_name }}"
+          if [ "$src" != "$dst" ]; then
+            mv "$src" "$dst"
+          fi
+          ls -la "dist/${{ matrix.asset_name }}"
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Resolve target release tag
+        id: tag
+        run: |
+          tag=""
+          case "${{ github.event_name }}" in
+            release)            tag="${{ github.event.release.tag_name }}" ;;
+            push)               tag="${{ github.ref_name }}" ;;
+            workflow_dispatch)  tag="${{ github.event.inputs.release_tag }}" ;;
+          esac
+          echo "Resolved release tag: '$tag'"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Attach binary to GitHub Release
+        if: steps.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          echo "Attaching dist/${{ matrix.asset_name }} to release $tag"
+          # Create the release lazily so push-tag and workflow_dispatch
+          # both work even if no release object exists yet.
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag does not exist — creating it."
+            gh release create "$tag" --title "$tag" --generate-notes --latest
+          fi
+          # --clobber lets re-runs replace an older binary in place
+          # instead of refusing to upload.
+          gh release upload "$tag" "dist/${{ matrix.asset_name }}" --clobber

@@ -11,6 +11,7 @@ setup(
     install_requires=[
         "numpy>=1.22",
         "matplotlib>=3.5",
+        "requests>=2.28",
     ],
     entry_points={
         "console_scripts": [
