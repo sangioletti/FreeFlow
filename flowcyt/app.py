@@ -4023,18 +4023,20 @@ class GateWindow:
 
         mask = self.gate.contains(fcs.data[:, xi], fcs.data[:, yi])
 
-        # Handle parent mask (walk up the hierarchy)
-        if self.gate.parent_gate_uid:
-            parent = next((g for g in self.app.gate_mgr.gates
-                           if g.uid == self.gate.parent_gate_uid), None)
-            if parent:
-                try:
-                    pxi = fcs.channel_names.index(parent.x_channel)
-                    pyi = fcs.channel_names.index(parent.y_channel)
-                    pmask = parent.contains(fcs.data[:, pxi], fcs.data[:, pyi])
-                    mask = mask & pmask
-                except ValueError:
-                    pass
+        # Handle parent mask (walk up the FULL hierarchy, not just one level)
+        g = self.gate
+        while g.parent_gate_uid:
+            parent = next((p for p in self.app.gate_mgr.gates
+                           if p.uid == g.parent_gate_uid), None)
+            if parent is None:
+                break
+            try:
+                pxi = fcs.channel_names.index(parent.x_channel)
+                pyi = fcs.channel_names.index(parent.y_channel)
+                mask = mask & parent.contains(fcs.data[:, pxi], fcs.data[:, pyi])
+            except ValueError:
+                pass
+            g = parent
         return mask
 
     def _current_xy(self):
