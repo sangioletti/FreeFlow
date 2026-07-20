@@ -24,6 +24,19 @@ from .gating import Gate, QuadrantGate, ThresholdGate
 _LABEL_OUTLINE = [path_effects.withStroke(linewidth=2.5, foreground="white")]
 
 
+def _fmt_bound(v: float) -> str:
+    """Format a gate boundary value compactly for on-plot labels.
+
+    Flow values span from near-zero up to hundreds of thousands, so use a
+    thousands separator for large magnitudes and one decimal otherwise.
+    """
+    if abs(v) >= 1000:
+        return f"{v:,.0f}"
+    if abs(v) >= 10:
+        return f"{v:.0f}"
+    return f"{v:.1f}"
+
+
 # ------------------------------------------------------------------ #
 #  Fast histogram-based density (replaces scipy.stats.gaussian_kde)
 # ------------------------------------------------------------------ #
@@ -251,6 +264,16 @@ def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0,
         to_display = to_data = None
         mid_disp = None
 
+    # Boundary conditions per quadrant, expressed relative to the crosshair
+    # position (mid_x, mid_y) in data coordinates.
+    bx, by = _fmt_bound(mx), _fmt_bound(my)
+    q_bounds = {
+        "Q1": f"x≥{bx}, y≥{by}",
+        "Q2": f"x<{bx}, y≥{by}",
+        "Q3": f"x<{bx}, y<{by}",
+        "Q4": f"x≥{bx}, y<{by}",
+    }
+
     for q, (cx, cy) in corners.items():
         s = quadrant_stats.get(q)
         if not s:
@@ -272,7 +295,10 @@ def _draw_quadrant_overlay(ax, gate: QuadrantGate, linewidth: float = 2.0,
 
         is_selected = (q == gate.quadrant)
         sel_marker = " *" if is_selected else ""
-        text = f"{q}: {s.get('count', 0):,}  ({s.get('percent', 0.0):.1f}%){sel_marker}"
+        text = (
+            f"{q}: {s.get('count', 0):,}  ({s.get('percent', 0.0):.1f}%){sel_marker}"
+            f"\n{q_bounds[q]}"
+        )
         txt = ax.text(
             px, py, text,
             ha="center", va="center",
@@ -288,6 +314,10 @@ def _draw_threshold_overlay(ax, gate: ThresholdGate, linewidth: float = 2.0,
     """Draw a vertical threshold line and shade the selected side."""
     display_label = label_text if label_text is not None else gate.name
     tx = gate.threshold
+
+    # Append the boundary condition defining the selected region.
+    bound = f"x<{_fmt_bound(tx)}" if gate.side == "left" else f"x≥{_fmt_bound(tx)}"
+    display_label = f"{display_label}\n{bound}"
 
     ax.axvline(tx, color=gate.color, lw=linewidth, ls="--", alpha=0.7)
 

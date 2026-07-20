@@ -1798,6 +1798,10 @@ class FlowCytApp:
                 lbl = gate.name
 
             if isinstance(gate, ThresholdGate):
+                # Boundary condition defining the selected region.
+                from .plotting import _fmt_bound
+                _tb = _fmt_bound(gate.threshold)
+                bound = f"x<{_tb}" if gate.side == "left" else f"x≥{_tb}"
                 if pw_params is not None:
                     dmin, dmax, anchor, frac = pw_params
                     t_pos = self._pw_transform(
@@ -1815,7 +1819,8 @@ class FlowCytApp:
                     ylim = self.ax_main.get_ylim()
                     import matplotlib.patheffects as _pe
                     _ann = self.ax_main.annotate(
-                        lbl, xy=(t_pos, ylim[1] * 0.9 if ylim[1] > 0 else 0),
+                        f"{lbl}\n{bound}",
+                        xy=(t_pos, ylim[1] * 0.9 if ylim[1] > 0 else 0),
                         xytext=(5, -10), textcoords="offset points",
                         fontsize=8, fontweight="bold", color=gate.color,
                     )
@@ -4333,10 +4338,31 @@ class GateWindow:
         total = fcs.num_events
         count = int(mask.sum())
         pct = 100.0 * count / total if total else 0
+
+        # Fraction relative to the parent gate's population (the parent's
+        # own full ancestor-chain count).  For a top-level gate the parent
+        # is the full sample, so the parent fraction equals the total one.
+        parent_gate = None
+        if self.gate.parent_gate_uid:
+            parent_gate = next(
+                (p for p in self.app.gate_mgr.gates
+                 if p.uid == self.gate.parent_gate_uid), None,
+            )
+        if parent_gate is not None:
+            parent_count = int(self.app._get_gate_mask(parent_gate).sum())
+            pct_parent = 100.0 * count / parent_count if parent_count else 0
+            parent_line = (
+                f"Pct of parent ({parent_gate.name}): {pct_parent:.1f}%  "
+                f"({count:,} / {parent_count:,})\n"
+            )
+        else:
+            parent_line = "Pct of parent: n/a (top-level gate)\n"
+
         info = (
             f"Gate: {self.gate.name}\n"
             f"Events: {count:,} / {total:,}\n"
             f"Pct of total: {pct:.1f}%\n"
+            + parent_line
         )
         # Show child gate stats
         child_gates = [g for g in self.app.gate_mgr.gates
