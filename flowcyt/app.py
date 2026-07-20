@@ -1495,12 +1495,18 @@ class FlowCytApp:
             x = self.fcs.data[:, xi].copy()
             y = self.fcs.data[:, yi].copy()
 
-            # If parent gate selected, show only those points
+            # If a gate is selected, show only the points that fall inside
+            # it *and* every one of its ancestor gates.  We use the full
+            # ancestor-chain mask (computed over the whole dataset) rather
+            # than only the selected gate's own geometry, and we apply it
+            # regardless of whether the selected gate happens to be drawn on
+            # the channel pair currently on screen — the events plotted are
+            # always the exact population that gate selects.
             parent_mask = None
             if self._selected_parent_uid:
                 parent_gate = next((g for g in self.gate_mgr.gates if g.uid == self._selected_parent_uid), None)
-                if parent_gate and parent_gate.x_channel == xn and parent_gate.y_channel == yn:
-                    parent_mask = parent_gate.contains(x, y)
+                if parent_gate:
+                    parent_mask = self._get_gate_mask(parent_gate)
                     x = x[parent_mask]
                     y = y[parent_mask]
                     if log_zoom:
