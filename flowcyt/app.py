@@ -63,6 +63,7 @@ from .plotting import (
     draw_gate_overlay,
     summary_bar_chart,
     summary_histogram,
+    _fmt_bound,
 )
 from .markers import (
     load_markers, load_hidden_channels, effective_channel_label,
@@ -1734,28 +1735,51 @@ class FlowCytApp:
             )
             return
 
+        gate_by_uid = {g.uid: g for g in self.gate_mgr.gates}
+
         lines = []
         for s in stats:
             indent = "  " if s.get("parent_uid") else ""
             name = s["name"]
+            gate = gate_by_uid.get(s["uid"])
             # For quadrant gates, show a header line (the gate's name +
             # selected quadrant) followed by one indented line per quadrant
             # so the user sees Q1..Q4 stats at a glance, not just the
-            # selected one.
+            # selected one.  Each quadrant line also carries the boundary
+            # condition that defines it, relative to the crosshair.
             qb = s.get("quadrant_breakdown")
             if qb:
                 sel = s.get("selected_quadrant", "")
                 lines.append(f"{indent}{name:6s}  (Q-split, sel={sel})")
+                if isinstance(gate, QuadrantGate):
+                    bx, by = _fmt_bound(gate.mid_x), _fmt_bound(gate.mid_y)
+                    q_bounds = {
+                        "Q1": f"x>={bx}, y>={by}",
+                        "Q2": f"x<{bx}, y>={by}",
+                        "Q3": f"x<{bx}, y<{by}",
+                        "Q4": f"x>={bx}, y<{by}",
+                    }
+                else:
+                    q_bounds = {}
                 for q in ("Q1", "Q2", "Q3", "Q4"):
                     qs = qb.get(q) or {}
                     marker = "*" if q == sel else " "
+                    bnd = q_bounds.get(q, "")
+                    bnd_txt = f"  [{bnd}]" if bnd else ""
                     lines.append(
                         f"{indent}  {marker}{q}  {qs.get('count', 0):>8,}  "
-                        f"({qs.get('percent', 0.0):.1f}%)"
+                        f"({qs.get('percent', 0.0):.1f}%){bnd_txt}"
                     )
             else:
+                # For 1D threshold gates, append the region's boundary.
+                bnd_txt = ""
+                if isinstance(gate, ThresholdGate):
+                    tb = _fmt_bound(gate.threshold)
+                    bnd = f"x<{tb}" if gate.side == "left" else f"x>={tb}"
+                    bnd_txt = f"  [{bnd}]"
                 lines.append(
-                    f"{indent}{name:6s}  {s['count']:>8,}  ({s['percent']:.1f}%)"
+                    f"{indent}{name:6s}  {s['count']:>8,}  "
+                    f"({s['percent']:.1f}%){bnd_txt}"
                 )
         text = "\n".join(lines)
         self.ax_stats.text(
