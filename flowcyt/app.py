@@ -3575,12 +3575,19 @@ class FlowCytApp:
         """Open an independent window showing only events inside *gate*."""
         if self.fcs is None:
             return
-        # Close existing window for this gate if any
-        if gate.uid in self._gate_windows:
-            try:
-                plt.close(self._gate_windows[gate.uid].fig)
-            except Exception:
-                pass
+        # Close any existing window for this gate before opening a new one.
+        # Windows are keyed by uid, but matplotlib identifies figures by
+        # their (name-based) label, so re-applying a gate under the same
+        # name reopens onto the same figure. Match on both uid and gate
+        # name so the stale figure and its orphaned wrapper are cleaned up
+        # rather than left to stack axes / duplicate event handlers.
+        for uid, gw in list(self._gate_windows.items()):
+            if uid == gate.uid or gw.gate.name == gate.name:
+                try:
+                    plt.close(gw.fig)
+                except Exception:
+                    pass
+                del self._gate_windows[uid]
 
         gw = GateWindow(self, gate)
         self._gate_windows[gate.uid] = gw
@@ -3880,6 +3887,11 @@ class GateWindow:
         self._child_windows: dict[str, "GateWindow"] = {}
 
         self.fig = plt.figure(f"Gate: {gate.name}", figsize=(10, 8))
+        # matplotlib returns an already-open figure when one with the same
+        # label exists (e.g. a gate re-applied under the same name). Clear
+        # it so we build onto a blank canvas instead of stacking a second
+        # set of axes over the previous plot.
+        self.fig.clf()
         _theme.style_window(self.fig)
         _theme.panel_background(self.fig, 0.69, 0.04, 0.295, 0.93)
         self.fig.subplots_adjust(left=0.08, right=0.72, top=0.93, bottom=0.08)
@@ -5164,11 +5176,13 @@ class GateWindow:
         """Open a sub-window for a child gate."""
         if self.app.fcs is None:
             return
-        if gate.uid in self._child_windows:
-            try:
-                plt.close(self._child_windows[gate.uid].fig)
-            except Exception:
-                pass
+        # Close any existing child window for this gate — matched by uid and
+        # by name, since matplotlib figures share identity by their
+        # (name-based) label and would otherwise stack axes / orphan the old
+        # wrapper when a gate is re-applied under the same name.
+        for uid, gw in list(self._child_windows.items()):
+            if uid == gate.uid or gw.gate.name == gate.name:
+                self._close_child_window(uid)
         gw = GateWindow(self.app, gate, parent_window=self)
         self._child_windows[gate.uid] = gw
         # Also register in the main app's gate_windows for file-change sync
