@@ -84,6 +84,11 @@ MODE_TRANSLATE = "Translate"
 MODE_ROTATE = "Rotate"
 MODE_STRETCH = "Stretch"
 
+# Axis-scale cycle shared by the main window and gate sub-windows.
+#   linear -> log (symlog) -> biexp (asinh biexponential) -> linear
+_SCALE_NEXT = {"linear": "log", "log": "biexp", "biexp": "linear"}
+_SCALE_SHORT = {"linear": "Lin", "log": "Log", "biexp": "Biexp"}
+
 
 class FlowCytApp:
     """Interactive matplotlib-based flow cytometry viewer."""
@@ -315,11 +320,11 @@ class FlowCytApp:
         self.fig.text(right_start, 0.775, "Scale", fontsize=10, fontweight="bold")
         scale_btn_w = ctrl_w / 2 - 0.005
         self.ax_xscale = self.fig.add_axes([right_start, 0.735, scale_btn_w, btn_h])
-        self.btn_xscale = Button(self.ax_xscale, "X: Linear")
+        self.btn_xscale = Button(self.ax_xscale, "X: Lin")
         self.btn_xscale.on_clicked(lambda e: self._toggle_scale("x"))
 
         self.ax_yscale = self.fig.add_axes([right_start + scale_btn_w + 0.01, 0.735, scale_btn_w, btn_h])
-        self.btn_yscale = Button(self.ax_yscale, "Y: Linear")
+        self.btn_yscale = Button(self.ax_yscale, "Y: Lin")
         self.btn_yscale.on_clicked(lambda e: self._toggle_scale("y"))
 
         # --- View mode toggle (2D scatter ↔ 1D histogram) ---
@@ -910,17 +915,15 @@ class FlowCytApp:
         self.btn_ylabel.label.set_fontsize(7)
 
     def _toggle_scale(self, axis: str):
-        """Toggle axis scale between linear and log."""
+        """Cycle an axis scale: linear -> log -> biexp -> linear."""
         self._refreshing = True
         if axis == "x":
-            self._x_scale = "log" if self._x_scale == "linear" else "linear"
-            label = f"X: {self._x_scale.capitalize()}"
-            self.btn_xscale.label.set_text(label)
+            self._x_scale = _SCALE_NEXT[self._x_scale]
+            self.btn_xscale.label.set_text(f"X: {_SCALE_SHORT[self._x_scale]}")
             self._log(f"X scale: {self._x_scale}")
         else:
-            self._y_scale = "log" if self._y_scale == "linear" else "linear"
-            label = f"Y: {self._y_scale.capitalize()}"
-            self.btn_yscale.label.set_text(label)
+            self._y_scale = _SCALE_NEXT[self._y_scale]
+            self.btn_yscale.label.set_text(f"Y: {_SCALE_SHORT[self._y_scale]}")
             self._log(f"Y scale: {self._y_scale}")
         # Keep _refreshing=True → call worker directly
         self._do_refresh_plot()
@@ -1471,6 +1474,52 @@ class FlowCytApp:
             return 1.0
         return max(float(np.percentile(nonzero, 1)), 1e-3)
 
+    @staticmethod
+    def _compute_linear_width(arr: np.ndarray) -> float:
+        """Quasi-linear width for the biexponential (asinh) scale.
+
+        After compensation the no-signal events form a noise cloud that
+        straddles zero. On a log / symlog axis that single cloud is split
+        into a gap around zero with near-symmetric mirror populations on
+        either side — an artefact, not real biology. Sizing the asinh
+        scale's linear region to roughly the noise spread collapses the
+        cloud back into a single peak near zero.
+
+        The negative values are (almost) pure noise, so estimate the noise
+        sigma robustly from them via the half-normal relation
+        ``median(|neg|) = 0.6745 * sigma`` and use ~2 sigma as the width.
+        Falls back to a robust scale of all non-zero magnitudes when there
+        are too few negatives.
+        """
+        if len(arr) == 0:
+            return 1.0
+        neg = -arr[arr < 0]
+        if len(neg) >= 10:
+            sigma = float(np.median(neg)) / 0.6745
+        else:
+            nz = np.abs(arr[arr != 0])
+            sigma = float(np.median(nz)) / 0.6745 if len(nz) else 1.0
+        return max(sigma * 2.0, 1e-3)
+
+    @staticmethod
+    def _apply_axis_scale(ax, which: str, scale: str, data: np.ndarray) -> None:
+        """Apply 'linear', 'log' (symlog) or 'biexp' (asinh) to one axis.
+
+        * log   -> symlog: linear within a narrow band, log beyond it.
+        * biexp -> asinh biexponential: a wide quasi-linear region around
+          zero that smoothly becomes logarithmic for large |values|. This
+          is the flow-cytometry standard for compensated data — it keeps
+          the zero-centred noise cloud as one population instead of
+          splitting it around a gap at zero.
+        """
+        setter = ax.set_xscale if which == "x" else ax.set_yscale
+        if scale == "log" and len(data) > 0:
+            setter("symlog", linthresh=FlowCytApp._compute_linthresh(data))
+        elif scale == "biexp" and len(data) > 0:
+            setter("asinh", linear_width=FlowCytApp._compute_linear_width(data))
+        else:
+            setter("linear")
+
     def _refresh_plot(self, log_zoom: bool = False):
         """Public entry point — sets _refreshing and delegates to worker."""
         if self.fcs is None or self._refreshing:
@@ -1562,10 +1611,7 @@ class FlowCytApp:
                 _theme.style_plot_axes(self.ax_main)
 
                 if pw is None:
-                    if self._x_scale == "log":
-                        self.ax_main.set_xscale("symlog", linthresh=self._compute_linthresh(x))
-                    else:
-                        self.ax_main.set_xscale("linear")
+                    self._apply_axis_scale(self.ax_main, "x", self._x_scale, x)
 
                 # Draw gate ranges as vertical shaded spans
                 self._draw_1d_gate_overlays(xn, yn, x, y, pw_params=pw)
@@ -1579,15 +1625,8 @@ class FlowCytApp:
                 self.ax_main.set_ylabel(y_label)
 
                 # Apply axis scale AFTER plotting
-                if self._x_scale == "log":
-                    self.ax_main.set_xscale("symlog", linthresh=self._compute_linthresh(x))
-                else:
-                    self.ax_main.set_xscale("linear")
-
-                if self._y_scale == "log":
-                    self.ax_main.set_yscale("symlog", linthresh=self._compute_linthresh(y))
-                else:
-                    self.ax_main.set_yscale("linear")
+                self._apply_axis_scale(self.ax_main, "x", self._x_scale, x)
+                self._apply_axis_scale(self.ax_main, "y", self._y_scale, y)
 
                 # Compute stats for gate labels
                 _stats = self.gate_mgr.compute_stats(
@@ -3683,16 +3722,19 @@ class FlowCytApp:
         self._refresh_plot()
 
     def set_axis_scale(self, axis: str, scale: str):
-        """Set X or Y axis scale ('linear' or 'log')."""
+        """Set X or Y axis scale ('linear', 'log', or 'biexp')."""
         axis = axis.lower()
         scale = scale.lower()
-        if axis not in {"x", "y"} or scale not in {"linear", "log"}:
-            raise ValueError("axis must be x/y and scale linear/log")
-        current = self._x_scale if axis == "x" else self._y_scale
-        if current == scale:
-            return
-        # Re-use the toggle path so labels stay in sync.
-        self._toggle_scale(axis)
+        if axis not in {"x", "y"} or scale not in _SCALE_NEXT:
+            raise ValueError("axis must be x/y and scale linear/log/biexp")
+        # Advance the toggle (which keeps the button label + refresh in
+        # sync) until the requested scale is reached — at most one full
+        # cycle, since the toggle steps linear -> log -> biexp -> linear.
+        for _ in range(len(_SCALE_NEXT)):
+            current = self._x_scale if axis == "x" else self._y_scale
+            if current == scale:
+                return
+            self._toggle_scale(axis)
 
     def find_gate_by_name(self, name: str):
         for g in self.gate_mgr.gates:
@@ -4142,12 +4184,13 @@ class GateWindow:
         )
 
     def _toggle_scale(self, axis: str):
+        """Cycle an axis scale: linear -> log -> biexp -> linear."""
         if axis == "x":
-            self._x_scale = "log" if self._x_scale == "linear" else "linear"
-            self._btn_xs.label.set_text(f"X: {'Log' if self._x_scale == 'log' else 'Lin'}")
+            self._x_scale = _SCALE_NEXT[self._x_scale]
+            self._btn_xs.label.set_text(f"X: {_SCALE_SHORT[self._x_scale]}")
         else:
-            self._y_scale = "log" if self._y_scale == "linear" else "linear"
-            self._btn_ys.label.set_text(f"Y: {'Log' if self._y_scale == 'log' else 'Lin'}")
+            self._y_scale = _SCALE_NEXT[self._y_scale]
+            self._btn_ys.label.set_text(f"Y: {_SCALE_SHORT[self._y_scale]}")
         self._refresh()
 
     def _toggle_view(self):
@@ -4327,27 +4370,15 @@ class GateWindow:
                 f"Gate: {self.gate.name}  ({mask.sum():,} events) — 1D"
             )
             if pw is None:
-                if self._x_scale == "log" and len(x) > 0:
-                    self.ax.set_xscale("symlog",
-                                       linthresh=FlowCytApp._compute_linthresh(x))
-                else:
-                    self.ax.set_xscale("linear")
+                FlowCytApp._apply_axis_scale(self.ax, "x", self._x_scale, x)
         else:
             density_scatter(self.ax, x, y)
             self.ax.set_xlabel(names[xi])
             self.ax.set_ylabel(names[yi])
             self.ax.set_title(f"Gate: {self.gate.name}  ({mask.sum():,} events)")
 
-            if self._x_scale == "log" and len(x) > 0:
-                self.ax.set_xscale("symlog",
-                                   linthresh=FlowCytApp._compute_linthresh(x))
-            else:
-                self.ax.set_xscale("linear")
-            if self._y_scale == "log" and len(y) > 0:
-                self.ax.set_yscale("symlog",
-                                   linthresh=FlowCytApp._compute_linthresh(y))
-            else:
-                self.ax.set_yscale("linear")
+            FlowCytApp._apply_axis_scale(self.ax, "x", self._x_scale, x)
+            FlowCytApp._apply_axis_scale(self.ax, "y", self._y_scale, y)
 
             # Draw child gate overlays on this window's plot
             xn = fcs.channel_names[xi]

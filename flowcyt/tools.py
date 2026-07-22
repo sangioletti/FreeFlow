@@ -252,12 +252,23 @@ def _additive_tools() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "set_axis_scale",
-                "description": "Set the scale of an axis ('linear' or 'log').",
+                "description": (
+                    "Set the scale of an axis. 'linear' is a plain axis; "
+                    "'log' is symlog (narrow linear band around zero, log "
+                    "beyond); 'biexp' is an asinh biexponential with a wide "
+                    "quasi-linear region around zero — the flow-cytometry "
+                    "standard for compensated data, which keeps the "
+                    "zero-centred noise cloud as one population instead of "
+                    "splitting it around a gap at zero."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "axis": {"type": "string", "enum": ["x", "y"]},
-                        "scale": {"type": "string", "enum": ["linear", "log"]},
+                        "scale": {
+                            "type": "string",
+                            "enum": ["linear", "log", "biexp"],
+                        },
                     },
                     "required": ["axis", "scale"],
                 },
@@ -402,25 +413,31 @@ def build_system_prompt(app) -> str:
         "    because you are creating a new gate.  Only call `set_axis_scale` if",
         "    the user explicitly asks for a scale change.  Anything you draw is",
         "    rendered on the user's currently-selected scale; preserve it.",
+        "  * A 'biexp' (biexponential / asinh) axis reads like a log axis for",
+        "    positive populations, but its wide linear region around zero",
+        "    keeps the compensated near-zero noise cloud as a SINGLE blob.",
+        "    Treat 'negative' / 'null' populations as the events clustered",
+        "    around zero — not a separate population sitting below zero.",
         "  * When the user references the plot they're looking at, assume they",
-        "    mean it as currently scaled (log axes stay log).",
+        "    mean it as currently scaled (log/biexp axes stay log/biexp).",
         "",
-        "DESTRUCTIVE ACTIONS PROTOCOL — applies to `remove_gate`,",
-        "`clear_all_gates`, and `export_csv`. Both steps are mandatory:",
-        "  Step 1. When the user first asks for a destructive action, REPLY",
-        "          asking them to confirm in plain English (e.g. \"Are you",
-        "          sure you want to clear all gates?\"). Do NOT call any",
-        "          destructive tool in this turn.",
+        "DESTRUCTIVE ACTIONS PROTOCOL — applies to `export_csv` ONLY. Gate",
+        "removal (`remove_gate`, `clear_all_gates`) runs immediately without",
+        "any confirmation, so just call it when the user asks. For",
+        "`export_csv`, both steps are mandatory:",
+        "  Step 1. When the user first asks to export, REPLY asking them to",
+        "          confirm in plain English (e.g. \"Export these events to",
+        "          CSV?\"). Do NOT call `export_csv` in this turn.",
         "  Step 2. Once the user confirms verbally (e.g. \"yes\", \"go ahead\",",
         "          \"do it\"), reply with a short message telling them the GUI",
         "          will now show a Yes/No button that they must press to",
-        "          finalise the action, and IMMEDIATELY call the requested",
-        "          destructive tool in the same turn. The GUI's Yes/No",
-        "          button is the only mechanism that actually authorises",
-        "          the action — your tool call only surfaces the button.",
-        "Never skip Step 1, even if the user sounds certain.  Never call a",
-        "destructive tool without also telling the user to press the Yes",
-        "button.",
+        "          finalise the export, and IMMEDIATELY call `export_csv` in",
+        "          the same turn. The GUI's Yes/No button is the only",
+        "          mechanism that actually authorises the export — your tool",
+        "          call only surfaces the button.",
+        "Never skip Step 1 for an export, even if the user sounds certain.",
+        "Never call `export_csv` without also telling the user to press the",
+        "Yes button.",
         "",
     ]
     if app.fcs is None:
@@ -621,8 +638,10 @@ def _tool_set_parent_gate(app, args):
 def _tool_set_axis_scale(app, args):
     axis = str(args["axis"]).lower()
     scale = str(args["scale"]).lower()
-    if axis not in {"x", "y"} or scale not in {"linear", "log"}:
-        raise ToolError("axis must be 'x' or 'y' and scale 'linear' or 'log'.")
+    if axis not in {"x", "y"} or scale not in {"linear", "log", "biexp"}:
+        raise ToolError(
+            "axis must be 'x' or 'y' and scale 'linear', 'log', or 'biexp'."
+        )
     app.set_axis_scale(axis, scale)
     return f"Set {axis}-axis scale to {scale}."
 

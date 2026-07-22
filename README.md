@@ -249,9 +249,23 @@ protein marker in parentheses, e.g. `FL1-A (CD4)`.
 
 ### Scale and view-mode toggles
 
-- **X: Linear / X: Log** — flips the X axis between linear and `symlog`
-  (handles zero / negative values gracefully). Independent of Y.
-- **Y: Linear / Y: Log** — same for Y.
+- **X: Lin / Log / Biexp** — cycles the X axis through three scales
+  (independent of Y):
+  - **Lin** — plain linear axis.
+  - **Log** — `symlog`: linear within a narrow band around zero, log
+    beyond. Handles zero / negative values but keeps the linear band
+    narrow.
+  - **Biexp** — `asinh` biexponential: a *wide* quasi-linear region
+    around zero that smoothly becomes logarithmic for large values. This
+    is the flow-cytometry standard for **compensated** data. Compensation
+    produces negative values, and the zero / no-signal events form a
+    noise cloud straddling zero; on a linear or plain-log axis that single
+    cloud splits into a gap around zero with near-symmetric mirror
+    populations either side. Biexp sizes its linear region to the noise
+    spread (~2σ, estimated from the negative values), collapsing the cloud
+    back into one peak near zero. Reach for it whenever a channel looks
+    like it has twin populations hugging zero.
+- **Y: Lin / Log / Biexp** — same for Y.
 - **View: 2D Scatter / 1D Histogram** — switches the plot type.
   - In 2D mode you see a density-coloured scatter plot.
   - In 1D mode you see a histogram of the X channel. Gates are shown as
