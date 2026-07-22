@@ -369,7 +369,9 @@ def _destructive_tools() -> list[dict[str, Any]]:
     ]
 
 
-DESTRUCTIVE_TOOL_NAMES = {"remove_gate", "clear_all_gates", "export_csv"}
+# Gate removal (single or all) runs without confirmation so DeepSeek can
+# finish a gating strategy autonomously; only file export still prompts.
+DESTRUCTIVE_TOOL_NAMES = {"export_csv"}
 
 
 def all_tools() -> list[dict[str, Any]]:
@@ -733,7 +735,7 @@ DISPATCH: dict[str, Callable] = {
 #  Agentic loop
 # ---------------------------------------------------------------------------- #
 
-MAX_TOOL_ITERATIONS = 6
+MAX_TOOL_ITERATIONS = 100
 
 
 def run_chat_turn(
