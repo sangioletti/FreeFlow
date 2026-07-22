@@ -105,6 +105,9 @@ class FCSData:
         self.is_compensated = False
         self.spillover_matrix: np.ndarray | None = None
         self.spillover_channels: list[str] = []
+        # Human-readable compensation notes surfaced to the UI (e.g. no
+        # matrix present, or a diagonal matrix that applies no spillover).
+        self.compensation_warnings: list[str] = []
         self._apply_compensation()
 
     def _build_int_dtype(self, endian: str, n_par: int):
@@ -172,7 +175,12 @@ class FCSData:
                 found[key] = val.strip()
 
         if not found:
-            return  # No compensation matrix — nothing to do
+            # No embedded spillover matrix — data is left uncompensated.
+            self.compensation_warnings.append(
+                "No compensation/spillover matrix found in this file "
+                "($SPILLOVER / SPILL absent). Data is NOT compensated."
+            )
+            return
 
         # De-duplicate by value — different keywords may carry the same matrix
         unique_values = list(set(found.values()))
@@ -200,6 +208,16 @@ class FCSData:
                 f"{exc}.  Proceeding without compensation."
             )
             return
+
+        # A diagonal spillover matrix has no off-diagonal terms, i.e. no
+        # spillover between channels — compensating with it is a no-op.
+        off_diagonal = matrix - np.diag(np.diag(matrix))
+        if np.allclose(off_diagonal, 0.0):
+            self.compensation_warnings.append(
+                f"Compensation matrix from {source_keyword} is diagonal "
+                "(no off-diagonal spillover terms). Compensation has no "
+                "effect on the data."
+            )
 
         # Map spillover channel names to column indices in self.data
         col_indices: list[int] = []
