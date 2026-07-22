@@ -177,8 +177,8 @@ class FCSData:
         if not found:
             # No embedded spillover matrix — data is left uncompensated.
             self.compensation_warnings.append(
-                "No compensation/spillover matrix found in this file "
-                "($SPILLOVER / SPILL absent). Data is NOT compensated."
+                "WARNING: No compensation/spillover matrix found in this "
+                "file ($SPILLOVER / SPILL absent) — data is NOT compensated."
             )
             return
 
@@ -212,12 +212,7 @@ class FCSData:
         # A diagonal spillover matrix has no off-diagonal terms, i.e. no
         # spillover between channels — compensating with it is a no-op.
         off_diagonal = matrix - np.diag(np.diag(matrix))
-        if np.allclose(off_diagonal, 0.0):
-            self.compensation_warnings.append(
-                f"Compensation matrix from {source_keyword} is diagonal "
-                "(no off-diagonal spillover terms). Compensation has no "
-                "effect on the data."
-            )
+        is_diagonal = bool(np.allclose(off_diagonal, 0.0))
 
         # Map spillover channel names to column indices in self.data
         col_indices: list[int] = []
@@ -251,28 +246,26 @@ class FCSData:
         self.spillover_matrix = matrix
         self.spillover_channels = list(channel_names)
 
-        # Print terminal warning so the user knows compensation was applied
-        kw_str = (
-            " & ".join(found.keys()) if len(found) > 1
-            else list(found.keys())[0]
-        )
+        # Build a single, unambiguous message describing exactly what was
+        # found: a diagonal matrix (no real spillover, so no effect) versus
+        # a genuine non-diagonal compensation matrix.
+        if is_diagonal:
+            note = (
+                f"WARNING: Compensation matrix from {source_keyword} is "
+                "DIAGONAL (no off-diagonal spillover terms) — compensation "
+                "has no effect on the data."
+            )
+        else:
+            note = (
+                f"NON-DIAGONAL COMPENSATION MATRIX FOUND ({source_keyword}) "
+                f"— {n} channels compensated in-place: "
+                f"{', '.join(channel_names)}."
+            )
+        self.compensation_warnings.append(note)
+
+        # Mirror the exact same message to the terminal.
         print(f"\n{'=' * 70}", file=sys.stderr)
-        print(
-            f"  WARNING — Compensation matrix detected ({kw_str})",
-            file=sys.stderr,
-        )
-        print(
-            f"  {n} channels: {', '.join(channel_names)}",
-            file=sys.stderr,
-        )
-        print(
-            f"  Data has been compensated in-place.  All subsequent",
-            file=sys.stderr,
-        )
-        print(
-            f"  analyses will use the compensated values.",
-            file=sys.stderr,
-        )
+        print(f"  {note}", file=sys.stderr)
         print(f"{'=' * 70}\n", file=sys.stderr)
 
     @staticmethod

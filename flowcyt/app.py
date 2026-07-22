@@ -625,10 +625,11 @@ class FlowCytApp:
         num_gates = len(self.gate_mgr.gates)
         self._log(f"Loaded: {os.path.basename(path)}")
         self._log(f"Events: {self.fcs.num_events:,}, Channels: {self.fcs.num_channels}")
-        # Surface compensation warnings (no matrix, or diagonal/no-spillover
-        # matrix) so the user knows gating runs on uncompensated data.
-        for warning in self.fcs.compensation_warnings:
-            self._log(f"WARNING: {warning}")
+        # Surface the compensation status (no matrix, diagonal/no-spillover
+        # matrix, or a genuine non-diagonal matrix). Each message carries its
+        # own prefix, so log it verbatim.
+        for note in self.fcs.compensation_warnings:
+            self._log(note)
         if num_gates > 0:
             self._log(f"Keeping {num_gates} existing gate(s)")
 
