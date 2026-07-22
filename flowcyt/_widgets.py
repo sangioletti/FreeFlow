@@ -533,6 +533,112 @@ class _MacTextBox(_MplTextBox):
             pass
 
 
+class MacSlider:
+    """A minimal horizontal slider that works on macOS trackpads.
+
+    matplotlib's own ``Slider`` needs a reliable ``button_press_event`` on
+    its axes to grab the handle, which macOS trackpads drop for light
+    clicks. This slider instead drives itself from the figure canvas
+    press / motion / release stream — the same stream the Tk click bridge
+    repairs and that the plot's own click-drag gating already relies on —
+    so it grabs on a normal click everywhere.
+
+    It draws a track and a round handle on its own ``Axes`` (data coords
+    fixed to ``[0, 1] x [0, 1]``); ``value`` is reported in
+    ``[valmin, valmax]``. ``on_changed(value)`` fires live while dragging
+    (throttled) and once more on release. Callers add their own text label
+    beside the axes, matching the rest of the UI.
+    """
+
+    def __init__(self, ax, valmin=0.0, valmax=1.0, valinit=0.0,
+                 on_changed=None, color="tab:blue", throttle_s=0.05):
+        self.ax = ax
+        self.valmin = float(valmin)
+        self.valmax = float(valmax)
+        self.val = float(valinit)
+        self._on_changed = on_changed
+        self._dragging = False
+        self._throttle_s = throttle_s
+        self._last_emit = 0.0
+
+        ax.set_navigate(False)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        ax.axhline(0.5, 0.02, 0.98, color="0.6", lw=2, zorder=1)
+        (self._handle,) = ax.plot(
+            [self._frac()], [0.5], marker="o", ms=11,
+            color=color, markeredgecolor="white", markeredgewidth=1.0,
+            zorder=3, clip_on=False,
+        )
+
+        canvas = ax.figure.canvas
+        canvas.mpl_connect("button_press_event", self._on_press)
+        canvas.mpl_connect("motion_notify_event", self._on_motion)
+        canvas.mpl_connect("button_release_event", self._on_release)
+
+    # -- geometry --------------------------------------------------------
+    def _frac(self) -> float:
+        span = (self.valmax - self.valmin) or 1.0
+        return (self.val - self.valmin) / span
+
+    def _value_from_event(self, event) -> float | None:
+        x = event.xdata
+        if x is None:
+            # Pointer left the axes mid-drag — recover the axis-relative
+            # position from pixel coords and clamp.
+            if event.x is None:
+                return None
+            inv = self.ax.transAxes.inverted()
+            x = float(inv.transform((event.x, event.y))[0])
+        x = min(max(float(x), 0.0), 1.0)
+        return self.valmin + x * (self.valmax - self.valmin)
+
+    # -- events ----------------------------------------------------------
+    def _on_press(self, event):
+        if event.inaxes is not self.ax or event.button != 1:
+            return
+        self._dragging = True
+        self._apply(event, force=True)
+
+    def _on_motion(self, event):
+        if self._dragging:
+            self._apply(event, force=False)
+
+    def _on_release(self, event):
+        if self._dragging:
+            self._dragging = False
+            self._apply(event, force=True)
+
+    def _apply(self, event, force: bool):
+        val = self._value_from_event(event)
+        if val is None:
+            return
+        self.val = val
+        self._handle.set_xdata([self._frac()])
+        now = time.time()
+        emit = force or (now - self._last_emit) >= self._throttle_s
+        if emit:
+            self._last_emit = now
+            if self._on_changed is not None:
+                self._on_changed(self.val)
+        else:
+            # Keep the handle visually responsive between throttled emits.
+            self.ax.figure.canvas.draw_idle()
+
+    # -- programmatic control -------------------------------------------
+    def set_val(self, val: float, notify: bool = False):
+        self.val = min(max(float(val), self.valmin), self.valmax)
+        self._handle.set_xdata([self._frac()])
+        self.ax.figure.canvas.draw_idle()
+        if notify and self._on_changed is not None:
+            self._on_changed(self.val)
+
+
 # ---------------------------------------------------------------------------- #
 #  Public aliases — swap in the macOS-friendly classes on darwin.
 # ---------------------------------------------------------------------------- #

@@ -253,24 +253,48 @@ def _additive_tools() -> list[dict[str, Any]]:
             "function": {
                 "name": "set_axis_scale",
                 "description": (
-                    "Set the scale of an axis. 'linear' is a plain axis; "
-                    "'log' is symlog (narrow linear band around zero, log "
-                    "beyond); 'biexp' is an asinh biexponential with a wide "
-                    "quasi-linear region around zero — the flow-cytometry "
-                    "standard for compensated data, which keeps the "
-                    "zero-centred noise cloud as one population instead of "
-                    "splitting it around a gap at zero."
+                    "Set the baseline scale of an axis: 'linear' (plain) or "
+                    "'log' (symlog — narrow linear band around zero, log "
+                    "beyond). For compensated data with a noise cloud "
+                    "straddling zero, prefer set_axis_compression instead of "
+                    "log."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "axis": {"type": "string", "enum": ["x", "y"]},
-                        "scale": {
-                            "type": "string",
-                            "enum": ["linear", "log", "biexp"],
-                        },
+                        "scale": {"type": "string", "enum": ["linear", "log"]},
                     },
                     "required": ["axis", "scale"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "set_axis_compression",
+                "description": (
+                    "Set biexponential (asinh) compression toward zero for "
+                    "an axis, like FlowJo's width-basis slider. 'amount' is "
+                    "0..1: 0 is off (axis follows its linear/log baseline); "
+                    "larger values widen the quasi-linear region around zero "
+                    "so the compensated near-zero / negative noise cloud "
+                    "collapses into a single population instead of splitting "
+                    "into mirror populations around a gap at zero. ~0.5-0.7 "
+                    "is a typical starting point. Use this when a channel "
+                    "shows twin populations hugging zero."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "axis": {"type": "string", "enum": ["x", "y"]},
+                        "amount": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
+                    },
+                    "required": ["axis", "amount"],
                 },
             },
         },
@@ -413,13 +437,16 @@ def build_system_prompt(app) -> str:
         "    because you are creating a new gate.  Only call `set_axis_scale` if",
         "    the user explicitly asks for a scale change.  Anything you draw is",
         "    rendered on the user's currently-selected scale; preserve it.",
-        "  * A 'biexp' (biexponential / asinh) axis reads like a log axis for",
-        "    positive populations, but its wide linear region around zero",
-        "    keeps the compensated near-zero noise cloud as a SINGLE blob.",
-        "    Treat 'negative' / 'null' populations as the events clustered",
-        "    around zero — not a separate population sitting below zero.",
+        "  * Biexp compression (set_axis_compression, 0..1) applies an asinh",
+        "    transform: a wide linear region around zero that becomes log for",
+        "    large values. It keeps the compensated near-zero noise cloud as a",
+        "    SINGLE blob. If the user complains a channel shows twin / mirror",
+        "    populations hugging zero, that is a compensation artefact — raise",
+        "    that axis's compression (e.g. 0.6) rather than treating it as two",
+        "    real populations. Events clustered around zero are the",
+        "    'negative' / 'null' population.",
         "  * When the user references the plot they're looking at, assume they",
-        "    mean it as currently scaled (log/biexp axes stay log/biexp).",
+        "    mean it as currently scaled (log stays log; compression stays).",
         "",
         "DESTRUCTIVE ACTIONS PROTOCOL — applies to `export_csv` ONLY. Gate",
         "removal (`remove_gate`, `clear_all_gates`) runs immediately without",
@@ -471,6 +498,11 @@ def build_system_prompt(app) -> str:
     x_scale = getattr(app, "_x_scale", "linear")
     y_scale = getattr(app, "_y_scale", "linear")
     lines.append(f"Axis scales: x={x_scale}, y={y_scale}")
+    x_comp = float(getattr(app, "_x_biexp_t", 0.0) or 0.0)
+    y_comp = float(getattr(app, "_y_biexp_t", 0.0) or 0.0)
+    lines.append(
+        f"Biexp compression (0=off..1): x={x_comp:.2f}, y={y_comp:.2f}"
+    )
 
     parent_uid = getattr(app, "_selected_parent_uid", None)
     parent_name = None
@@ -638,12 +670,26 @@ def _tool_set_parent_gate(app, args):
 def _tool_set_axis_scale(app, args):
     axis = str(args["axis"]).lower()
     scale = str(args["scale"]).lower()
-    if axis not in {"x", "y"} or scale not in {"linear", "log", "biexp"}:
-        raise ToolError(
-            "axis must be 'x' or 'y' and scale 'linear', 'log', or 'biexp'."
-        )
+    if axis not in {"x", "y"} or scale not in {"linear", "log"}:
+        raise ToolError("axis must be 'x' or 'y' and scale 'linear' or 'log'.")
     app.set_axis_scale(axis, scale)
     return f"Set {axis}-axis scale to {scale}."
+
+
+def _tool_set_axis_compression(app, args):
+    axis = str(args["axis"]).lower()
+    if axis not in {"x", "y"}:
+        raise ToolError("axis must be 'x' or 'y'.")
+    try:
+        amount = float(args["amount"])
+    except (TypeError, ValueError):
+        raise ToolError("amount must be a number between 0 and 1.")
+    if not 0.0 <= amount <= 1.0:
+        raise ToolError("amount must be between 0 and 1.")
+    app.set_axis_compression(axis, amount)
+    if amount <= 0.0:
+        return f"Turned off biexp compression on the {axis}-axis."
+    return f"Set {axis}-axis biexp compression to {amount:.2f}."
 
 
 def _tool_rename_gate(app, args):
@@ -739,6 +785,7 @@ DISPATCH: dict[str, Callable] = {
     "select_channels":       _tool_select_channels,
     "set_parent_gate":       _tool_set_parent_gate,
     "set_axis_scale":        _tool_set_axis_scale,
+    "set_axis_compression":  _tool_set_axis_compression,
     "rename_gate":           _tool_rename_gate,
     "list_channels":         _tool_list_channels,
     "list_gates":            _tool_list_gates,

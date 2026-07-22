@@ -51,7 +51,7 @@ from matplotlib.patches import Rectangle as RectPatch, Polygon as PolyPatch, Ell
 # Use our macOS-friendly widget variants where a stock matplotlib widget
 # would otherwise need a Force/deep click on macOS trackpads.  On
 # Linux/Windows ``_widgets`` re-exports the stock classes unchanged.
-from ._widgets import Button, RadioButtons, install_tk_click_bridge
+from ._widgets import Button, MacSlider, RadioButtons, install_tk_click_bridge
 
 from .reader import FCSData
 from .gating import (
@@ -84,10 +84,11 @@ MODE_TRANSLATE = "Translate"
 MODE_ROTATE = "Rotate"
 MODE_STRETCH = "Stretch"
 
-# Axis-scale cycle shared by the main window and gate sub-windows.
-#   linear -> log (symlog) -> biexp (asinh biexponential) -> linear
-_SCALE_NEXT = {"linear": "log", "log": "biexp", "biexp": "linear"}
-_SCALE_SHORT = {"linear": "Lin", "log": "Log", "biexp": "Biexp"}
+# Axis-scale toggle shared by the main window and gate sub-windows.
+# The linear <-> log baseline is a button; biexponential compression around
+# zero is layered on top via a per-axis slider (see MacSlider / _biexp_t).
+_SCALE_NEXT = {"linear": "log", "log": "linear"}
+_SCALE_SHORT = {"linear": "Lin", "log": "Log"}
 
 
 class FlowCytApp:
@@ -128,6 +129,11 @@ class FlowCytApp:
         # Axis scale: "linear" or "log"
         self._x_scale: str = "linear"
         self._y_scale: str = "linear"
+        # Biexponential (asinh) compression around zero, per axis. 0 = off
+        # (axis follows the linear/log baseline above); >0 engages biexp
+        # with a wider linear region as the value grows (FlowJo width basis).
+        self._x_biexp_t: float = 0.0
+        self._y_biexp_t: float = 0.0
 
         # View mode: "2D" (scatter) or "1D" (histogram)
         self._view_mode: str = "2D"
@@ -327,8 +333,31 @@ class FlowCytApp:
         self.btn_yscale = Button(self.ax_yscale, "Y: Lin")
         self.btn_yscale.on_clicked(lambda e: self._toggle_scale("y"))
 
+        # --- Biexponential compression sliders (per axis) ---
+        # Drag toward the right to compress the compensated near-zero cloud
+        # into a single population; left edge = off (linear/log baseline).
+        self.fig.text(right_start, 0.708, "Compress →0 (biexp)",
+                      fontsize=8, fontweight="bold")
+        comp_h = 0.020
+        comp_y = 0.680
+        half_w = ctrl_w / 2 - 0.005
+        self.fig.text(right_start, comp_y + comp_h * 0.2, "X",
+                      fontsize=7, fontweight="bold")
+        self.ax_xcomp = self.fig.add_axes(
+            [right_start + 0.022, comp_y, half_w - 0.022, comp_h])
+        self.slider_xcomp = MacSlider(
+            self.ax_xcomp, 0.0, 1.0, self._x_biexp_t,
+            on_changed=lambda v: self._on_compress("x", v))
+        self.fig.text(right_start + half_w + 0.01, comp_y + comp_h * 0.2, "Y",
+                      fontsize=7, fontweight="bold")
+        self.ax_ycomp = self.fig.add_axes(
+            [right_start + half_w + 0.032, comp_y, half_w - 0.022, comp_h])
+        self.slider_ycomp = MacSlider(
+            self.ax_ycomp, 0.0, 1.0, self._y_biexp_t,
+            on_changed=lambda v: self._on_compress("y", v))
+
         # --- View mode toggle (2D scatter ↔ 1D histogram) ---
-        y_cur = 0.69
+        y_cur = 0.645
         self.ax_viewmode = self.fig.add_axes([right_start, y_cur, ctrl_w, btn_h])
         self.btn_viewmode = Button(self.ax_viewmode, "View: 2D Scatter")
         self.btn_viewmode.on_clicked(lambda e: self._toggle_view_mode())
@@ -346,7 +375,7 @@ class FlowCytApp:
         self.ax_compress_hint.set_visible(False)
 
         # --- Tool selector + Parent gate selector (side by side) ---
-        radio_h = 0.195                    # height for 9 radio items
+        radio_h = 0.165                    # height for 9 radio items
         y_cur -= 0.015                     # gap
         self.fig.text(right_start, y_cur, "Tool", fontsize=9, fontweight="bold")
         half_w = ctrl_w / 2 - 0.005
@@ -915,7 +944,7 @@ class FlowCytApp:
         self.btn_ylabel.label.set_fontsize(7)
 
     def _toggle_scale(self, axis: str):
-        """Cycle an axis scale: linear -> log -> biexp -> linear."""
+        """Toggle an axis scale between linear and log."""
         self._refreshing = True
         if axis == "x":
             self._x_scale = _SCALE_NEXT[self._x_scale]
@@ -926,6 +955,21 @@ class FlowCytApp:
             self.btn_yscale.label.set_text(f"Y: {_SCALE_SHORT[self._y_scale]}")
             self._log(f"Y scale: {self._y_scale}")
         # Keep _refreshing=True → call worker directly
+        self._do_refresh_plot()
+
+    def _on_compress(self, axis: str, value: float):
+        """Set the biexponential compression for an axis (slider callback).
+
+        ``value`` is the slider position in [0, 1]: 0 leaves the axis on
+        its linear/log baseline; larger values widen the asinh linear
+        region so the compensated near-zero cloud collapses toward a
+        single population. Fires live (throttled) while the slider drags.
+        """
+        self._refreshing = True
+        if axis == "x":
+            self._x_biexp_t = value
+        else:
+            self._y_biexp_t = value
         self._do_refresh_plot()
 
     def _toggle_view_mode(self):
@@ -1475,48 +1519,48 @@ class FlowCytApp:
         return max(float(np.percentile(nonzero, 1)), 1e-3)
 
     @staticmethod
-    def _compute_linear_width(arr: np.ndarray) -> float:
+    def _biexp_linear_width(t: float, data: np.ndarray) -> float:
         """Quasi-linear width for the biexponential (asinh) scale.
 
-        After compensation the no-signal events form a noise cloud that
-        straddles zero. On a log / symlog axis that single cloud is split
-        into a gap around zero with near-symmetric mirror populations on
-        either side — an artefact, not real biology. Sizing the asinh
-        scale's linear region to roughly the noise spread collapses the
-        cloud back into a single peak near zero.
+        Driven by a compression slider ``t`` in (0, 1] (FlowJo's "width
+        basis"). After compensation the no-signal events form a noise cloud
+        straddling zero; on a log axis it splits into a gap with mirror
+        populations either side. The asinh scale keeps a linear region
+        around zero and goes logarithmic beyond ``linear_width``; widening
+        that region collapses the cloud back into a single population.
 
-        The negative values are (almost) pure noise, so estimate the noise
-        sigma robustly from them via the half-normal relation
-        ``median(|neg|) = 0.6745 * sigma`` and use ~2 sigma as the width.
-        Falls back to a robust scale of all non-zero magnitudes when there
-        are too few negatives.
+        ``t`` is mapped log-uniformly onto the width so the slider feels
+        even across the huge dynamic range: small ``t`` -> narrow linear
+        region (most log-like, near-zero expanded); large ``t`` -> wide
+        linear region (near-zero compressed toward a single blob). The
+        endpoints are anchored to the channel's own magnitude so the same
+        slider position behaves sensibly on any channel.
         """
-        if len(arr) == 0:
+        if len(data) == 0:
             return 1.0
-        neg = -arr[arr < 0]
-        if len(neg) >= 10:
-            sigma = float(np.median(neg)) / 0.6745
-        else:
-            nz = np.abs(arr[arr != 0])
-            sigma = float(np.median(nz)) / 0.6745 if len(nz) else 1.0
-        return max(sigma * 2.0, 1e-3)
+        hi = max(float(np.percentile(np.abs(data), 99.5)), 1.0)
+        lo_w = hi * 1e-4
+        t = min(max(t, 1e-6), 1.0)
+        return float(lo_w * (hi / lo_w) ** t)
 
     @staticmethod
-    def _apply_axis_scale(ax, which: str, scale: str, data: np.ndarray) -> None:
-        """Apply 'linear', 'log' (symlog) or 'biexp' (asinh) to one axis.
+    def _apply_axis_scale(
+        ax, which: str, scale: str, data: np.ndarray, biexp_t: float = 0.0
+    ) -> None:
+        """Apply a scale to one axis.
 
-        * log   -> symlog: linear within a narrow band, log beyond it.
-        * biexp -> asinh biexponential: a wide quasi-linear region around
-          zero that smoothly becomes logarithmic for large |values|. This
-          is the flow-cytometry standard for compensated data — it keeps
-          the zero-centred noise cloud as one population instead of
-          splitting it around a gap at zero.
+        When ``biexp_t > 0`` the axis is a biexponential ``asinh`` scale
+        whose quasi-linear width is set by the compression slider — a wide
+        linear region around zero that becomes logarithmic for large
+        |values|, the flow-cytometry standard for compensated data. When
+        the slider is at zero the axis follows the linear/log baseline:
+        ``log`` -> symlog (linear within a narrow band, log beyond).
         """
         setter = ax.set_xscale if which == "x" else ax.set_yscale
-        if scale == "log" and len(data) > 0:
+        if biexp_t > 0 and len(data) > 0:
+            setter("asinh", linear_width=FlowCytApp._biexp_linear_width(biexp_t, data))
+        elif scale == "log" and len(data) > 0:
             setter("symlog", linthresh=FlowCytApp._compute_linthresh(data))
-        elif scale == "biexp" and len(data) > 0:
-            setter("asinh", linear_width=FlowCytApp._compute_linear_width(data))
         else:
             setter("linear")
 
@@ -1611,7 +1655,8 @@ class FlowCytApp:
                 _theme.style_plot_axes(self.ax_main)
 
                 if pw is None:
-                    self._apply_axis_scale(self.ax_main, "x", self._x_scale, x)
+                    self._apply_axis_scale(self.ax_main, "x", self._x_scale, x,
+                                           self._x_biexp_t)
 
                 # Draw gate ranges as vertical shaded spans
                 self._draw_1d_gate_overlays(xn, yn, x, y, pw_params=pw)
@@ -1625,8 +1670,10 @@ class FlowCytApp:
                 self.ax_main.set_ylabel(y_label)
 
                 # Apply axis scale AFTER plotting
-                self._apply_axis_scale(self.ax_main, "x", self._x_scale, x)
-                self._apply_axis_scale(self.ax_main, "y", self._y_scale, y)
+                self._apply_axis_scale(self.ax_main, "x", self._x_scale, x,
+                                       self._x_biexp_t)
+                self._apply_axis_scale(self.ax_main, "y", self._y_scale, y,
+                                       self._y_biexp_t)
 
                 # Compute stats for gate labels
                 _stats = self.gate_mgr.compute_stats(
@@ -3722,19 +3769,37 @@ class FlowCytApp:
         self._refresh_plot()
 
     def set_axis_scale(self, axis: str, scale: str):
-        """Set X or Y axis scale ('linear', 'log', or 'biexp')."""
+        """Set X or Y axis scale ('linear' or 'log').
+
+        Biexponential compression around zero is separate — see
+        :meth:`set_axis_compression`.
+        """
         axis = axis.lower()
         scale = scale.lower()
         if axis not in {"x", "y"} or scale not in _SCALE_NEXT:
-            raise ValueError("axis must be x/y and scale linear/log/biexp")
-        # Advance the toggle (which keeps the button label + refresh in
-        # sync) until the requested scale is reached — at most one full
-        # cycle, since the toggle steps linear -> log -> biexp -> linear.
-        for _ in range(len(_SCALE_NEXT)):
-            current = self._x_scale if axis == "x" else self._y_scale
-            if current == scale:
-                return
-            self._toggle_scale(axis)
+            raise ValueError("axis must be x/y and scale linear/log")
+        current = self._x_scale if axis == "x" else self._y_scale
+        if current == scale:
+            return
+        # Re-use the toggle path so the button label stays in sync.
+        self._toggle_scale(axis)
+
+    def set_axis_compression(self, axis: str, amount: float):
+        """Set biexponential compression toward zero for an axis.
+
+        ``amount`` is in [0, 1]: 0 turns biexp off (the axis follows its
+        linear/log baseline); larger values widen the asinh linear region
+        so the compensated near-zero cloud collapses toward one population.
+        Also moves the on-screen slider so the GUI stays in sync.
+        """
+        axis = axis.lower()
+        if axis not in {"x", "y"}:
+            raise ValueError("axis must be x or y")
+        amount = min(max(float(amount), 0.0), 1.0)
+        slider = self.slider_xcomp if axis == "x" else self.slider_ycomp
+        # Driving the slider fires _on_compress, which stores the value and
+        # refreshes the plot.
+        slider.set_val(amount, notify=True)
 
     def find_gate_by_name(self, name: str):
         for g in self.gate_mgr.gates:
@@ -3981,6 +4046,9 @@ class GateWindow:
         # Scale buttons
         self._x_scale = "linear"
         self._y_scale = "linear"
+        # Biexponential compression around zero, per axis (0 = off).
+        self._x_biexp_t = 0.0
+        self._y_biexp_t = 0.0
         half = cw / 2 - 0.005
         y_cur -= btn_h + 0.01
         ax_xs = self.fig.add_axes([rs, y_cur, half, btn_h])
@@ -3989,6 +4057,24 @@ class GateWindow:
         ax_ys = self.fig.add_axes([rs + half + 0.01, y_cur, half, btn_h])
         self._btn_ys = Button(ax_ys, "Y: Lin")
         self._btn_ys.on_clicked(lambda e: self._toggle_scale("y"))
+
+        # Biexp compression sliders (per axis): drag right to collapse the
+        # compensated near-zero cloud into one population; left = off.
+        y_cur -= 0.024
+        self.fig.text(rs, y_cur + 0.003, "Compress →0 (biexp)",
+                      fontsize=7, fontweight="bold")
+        y_cur -= 0.022
+        comp_h = 0.018
+        self.fig.text(rs, y_cur, "X", fontsize=7, fontweight="bold")
+        ax_xc = self.fig.add_axes([rs + 0.022, y_cur, half - 0.022, comp_h])
+        self._slider_xcomp = MacSlider(
+            ax_xc, 0.0, 1.0, self._x_biexp_t,
+            on_changed=lambda v: self._on_compress("x", v))
+        self.fig.text(rs + half + 0.01, y_cur, "Y", fontsize=7, fontweight="bold")
+        ax_yc = self.fig.add_axes([rs + half + 0.032, y_cur, half - 0.022, comp_h])
+        self._slider_ycomp = MacSlider(
+            ax_yc, 0.0, 1.0, self._y_biexp_t,
+            on_changed=lambda v: self._on_compress("y", v))
 
         # View mode toggle
         self._view_mode = "2D"
@@ -4184,13 +4270,21 @@ class GateWindow:
         )
 
     def _toggle_scale(self, axis: str):
-        """Cycle an axis scale: linear -> log -> biexp -> linear."""
+        """Toggle an axis scale between linear and log."""
         if axis == "x":
             self._x_scale = _SCALE_NEXT[self._x_scale]
             self._btn_xs.label.set_text(f"X: {_SCALE_SHORT[self._x_scale]}")
         else:
             self._y_scale = _SCALE_NEXT[self._y_scale]
             self._btn_ys.label.set_text(f"Y: {_SCALE_SHORT[self._y_scale]}")
+        self._refresh()
+
+    def _on_compress(self, axis: str, value: float):
+        """Set this gate window's biexp compression for an axis (slider)."""
+        if axis == "x":
+            self._x_biexp_t = value
+        else:
+            self._y_biexp_t = value
         self._refresh()
 
     def _toggle_view(self):
@@ -4370,15 +4464,18 @@ class GateWindow:
                 f"Gate: {self.gate.name}  ({mask.sum():,} events) — 1D"
             )
             if pw is None:
-                FlowCytApp._apply_axis_scale(self.ax, "x", self._x_scale, x)
+                FlowCytApp._apply_axis_scale(
+                    self.ax, "x", self._x_scale, x, self._x_biexp_t)
         else:
             density_scatter(self.ax, x, y)
             self.ax.set_xlabel(names[xi])
             self.ax.set_ylabel(names[yi])
             self.ax.set_title(f"Gate: {self.gate.name}  ({mask.sum():,} events)")
 
-            FlowCytApp._apply_axis_scale(self.ax, "x", self._x_scale, x)
-            FlowCytApp._apply_axis_scale(self.ax, "y", self._y_scale, y)
+            FlowCytApp._apply_axis_scale(
+                self.ax, "x", self._x_scale, x, self._x_biexp_t)
+            FlowCytApp._apply_axis_scale(
+                self.ax, "y", self._y_scale, y, self._y_biexp_t)
 
             # Draw child gate overlays on this window's plot
             xn = fcs.channel_names[xi]
