@@ -7,14 +7,14 @@ any external dependencies beyond numpy.  Supports:
   * $DATATYPE = F (float), D (double), I (integer)
   * $MODE = L (list mode)
   * $BYTEORD = little-endian and big-endian
-  * Embedded compensation / spillover matrices ($SPILLOVER, SPILL)
+
+Compensation is deliberately NOT read from the FCS file.  The embedded
+``$SPILLOVER`` / ``SPILL`` keywords are ignored; compensation comes only
+from an external settings XML (see compensation.py).  A file is treated
+as already-compensated purely by its name ending in ``_compensated.fcs``.
 """
 
 from __future__ import annotations
-
-import struct
-import sys
-import warnings
 
 import numpy as np
 
@@ -101,14 +101,16 @@ class FCSData:
             # Integer: read row-by-row with heterogeneous widths
             self.data = self._read_int_data(data_raw, endian, n_par, n_events)
 
-        # ---------- Compensation (spillover) ----------
-        self.is_compensated = False
+        # ---------- Compensation status (name-based only) ----------
+        # Embedded spillover is intentionally never read.  A file counts as
+        # compensated iff its name ends in ``_compensated.fcs``; the actual
+        # compensation is done up-front from the external XML.
+        self.is_compensated = self.filepath.lower().endswith("_compensated.fcs")
+        # Retained for API compatibility with older callers; always empty
+        # now that spillover is not sourced from the FCS itself.
         self.spillover_matrix: np.ndarray | None = None
         self.spillover_channels: list[str] = []
-        # Human-readable compensation notes surfaced to the UI (e.g. no
-        # matrix present, or a diagonal matrix that applies no spillover).
         self.compensation_warnings: list[str] = []
-        self._apply_compensation()
 
     def _build_int_dtype(self, endian: str, n_par: int):
         """Build a numpy structured dtype for integer-mode data."""
@@ -155,145 +157,8 @@ class FCSData:
         return meta
 
     # ------------------------------------------------------------------ #
-    #  Compensation / Spillover
+    #  Channel lookup
     # ------------------------------------------------------------------ #
-    def _apply_compensation(self):
-        """Detect embedded spillover matrices, validate, and compensate.
-
-        Checks the standard FCS keywords ``$SPILLOVER`` and the common
-        vendor variant ``SPILL``.  If exactly one unique matrix is found
-        the data is compensated in-place (spillover matrix inverted and
-        applied to the relevant channels).  If more than one *distinct*
-        matrix is found the programme aborts with an error.
-        """
-        # Collect all spillover keyword values present in the metadata
-        spill_keywords = ("$SPILLOVER", "SPILL")
-        found: dict[str, str] = {}  # keyword → raw value
-        for key in spill_keywords:
-            val = self.metadata.get(key)
-            if val is not None and val.strip():
-                found[key] = val.strip()
-
-        if not found:
-            # No embedded spillover matrix — data is left uncompensated.
-            self.compensation_warnings.append(
-                "WARNING: No compensation/spillover matrix found in this "
-                "file ($SPILLOVER / SPILL absent) — data is NOT compensated."
-            )
-            return
-
-        # De-duplicate by value — different keywords may carry the same matrix
-        unique_values = list(set(found.values()))
-        if len(unique_values) > 1:
-            keywords_str = ", ".join(found.keys())
-            msg = (
-                f"FATAL: Multiple distinct compensation matrices found in "
-                f"{self.filepath} (keywords: {keywords_str}).  Cannot "
-                f"determine which one to use — aborting."
-            )
-            print(f"\n{'=' * 70}", file=sys.stderr)
-            print(msg, file=sys.stderr)
-            print(f"{'=' * 70}\n", file=sys.stderr)
-            sys.exit(1)
-
-        # We have exactly one unique spillover matrix
-        source_keyword = list(found.keys())[0]
-        raw_value = unique_values[0]
-
-        try:
-            n, channel_names, matrix = self._parse_spillover(raw_value)
-        except Exception as exc:
-            warnings.warn(
-                f"Could not parse compensation matrix from {source_keyword}: "
-                f"{exc}.  Proceeding without compensation."
-            )
-            return
-
-        # A diagonal spillover matrix has no off-diagonal terms, i.e. no
-        # spillover between channels — compensating with it is a no-op.
-        off_diagonal = matrix - np.diag(np.diag(matrix))
-        is_diagonal = bool(np.allclose(off_diagonal, 0.0))
-
-        # Map spillover channel names to column indices in self.data
-        col_indices: list[int] = []
-        for ch in channel_names:
-            idx = self._find_channel_index(ch)
-            if idx is None:
-                warnings.warn(
-                    f"Compensation matrix references channel '{ch}' which "
-                    f"is not in the file.  Proceeding without compensation."
-                )
-                return
-            col_indices.append(idx)
-
-        # Invert the spillover matrix to obtain the compensation matrix
-        try:
-            comp_matrix = np.linalg.inv(matrix)
-        except np.linalg.LinAlgError:
-            warnings.warn(
-                "Spillover matrix is singular — cannot invert.  "
-                "Proceeding without compensation."
-            )
-            return
-
-        # Apply compensation: for each event, multiply the relevant
-        # channel values by the inverse spillover (compensation) matrix.
-        # data[:, cols] = data[:, cols] @ comp_matrix
-        subset = self.data[:, col_indices].copy()
-        self.data[:, col_indices] = subset @ comp_matrix
-
-        self.is_compensated = True
-        self.spillover_matrix = matrix
-        self.spillover_channels = list(channel_names)
-
-        # Build a single, unambiguous message describing exactly what was
-        # found: a diagonal matrix (no real spillover, so no effect) versus
-        # a genuine non-diagonal compensation matrix.
-        if is_diagonal:
-            note = (
-                f"WARNING: Compensation matrix from {source_keyword} is "
-                "DIAGONAL (no off-diagonal spillover terms) — compensation "
-                "has no effect on the data."
-            )
-        else:
-            note = (
-                f"NON-DIAGONAL COMPENSATION MATRIX FOUND ({source_keyword}) "
-                f"— {n} channels compensated in-place: "
-                f"{', '.join(channel_names)}."
-            )
-        self.compensation_warnings.append(note)
-
-        # Mirror the exact same message to the terminal.
-        print(f"\n{'=' * 70}", file=sys.stderr)
-        print(f"  {note}", file=sys.stderr)
-        print(f"{'=' * 70}\n", file=sys.stderr)
-
-    @staticmethod
-    def _parse_spillover(raw: str) -> tuple[int, list[str], np.ndarray]:
-        """Parse a ``$SPILLOVER`` / ``SPILL`` value string.
-
-        Format: ``n,Name1,Name2,...,NameN,S11,S12,...,SNN``
-
-        Returns (n, channel_names, matrix) where *matrix* is n×n
-        (row-major, dtype float64).
-        """
-        parts = [p.strip() for p in raw.split(",")]
-        n = int(parts[0])
-        if n <= 0:
-            raise ValueError(f"Invalid channel count in spillover: {n}")
-
-        expected_parts = 1 + n + n * n
-        if len(parts) < expected_parts:
-            raise ValueError(
-                f"Spillover string too short: expected {expected_parts} "
-                f"comma-separated values, got {len(parts)}"
-            )
-
-        channel_names = parts[1 : 1 + n]
-        coeffs = [float(v) for v in parts[1 + n : 1 + n + n * n]]
-        matrix = np.array(coeffs, dtype=np.float64).reshape(n, n)
-        return n, channel_names, matrix
-
     def _find_channel_index(self, name: str) -> int | None:
         """Find the column index for a channel name (case-insensitive).
 
@@ -361,9 +226,9 @@ class FCSData:
         ):
             lines.append(f"  {i}: {n:20s}  {lbl}")
         if self.is_compensated:
-            lines.append(
-                f"Compensation: applied ({len(self.spillover_channels)} channels)"
-            )
+            lines.append("Compensation: applied (file is a _compensated.fcs)")
         else:
-            lines.append("Compensation: none")
+            lines.append(
+                "Compensation: none (raw file — compensate via settings XML)"
+            )
         return "\n".join(lines)

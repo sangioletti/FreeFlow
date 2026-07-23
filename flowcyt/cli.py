@@ -5,6 +5,11 @@ Usage:
     flowcyt -i sample.fcs          # open a file directly
     flowcyt                        # launch GUI, open file dialog
     flowcyt --info sample.fcs      # print file metadata to stdout
+
+Compensation comes from a settings .xml in the same folder as the .fcs
+files; raw files are auto-compensated into *_compensated.fcs. If a folder
+has no .xml and no *_compensated.fcs, the GUI warns and exits. See the
+"Compensation" section of the README.
 """
 
 import argparse

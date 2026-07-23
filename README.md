@@ -193,12 +193,40 @@ flowcyt -i path/to/sample.fcs            # open a file directly
 flowcyt --info path/to/sample.fcs        # print metadata only, no GUI
 ```
 
-When no file is given, FreeFlow scans the current directory (one level
-deep) for `.fcs` files. The first one becomes the active file; use the
-File selector arrows to step through the others.
+When no file is given, FreeFlow scans the current directory for
+compensated files (see **Compensation** below) and lists them in the File
+selector; use its arrows to step through them.
 
 A log file `flowcyt.log` is written in the working directory each
 launch. Useful when reporting bugs.
+
+---
+
+## Compensation
+
+FreeFlow **never** reads a spillover / compensation matrix from inside an
+`.fcs` file. Compensation comes exclusively from a **settings `.xml`**
+file (BD FACSDiva format, `<bdfacs>` root) placed in the **same folder**
+as your `.fcs` files. The matrix used is the global, experiment-level
+*Cytometer Settings* matrix.
+
+On opening a folder:
+
+- **If a settings `.xml` is present**, FreeFlow generates a compensated
+  copy of every compatible `.fcs` — same name, ending in
+  `_compensated.fcs` — and shows only those. A file is *compatible* when
+  it contains all the channels the matrix references; incompatible files
+  are listed as skipped.
+- **Opening a raw `.fcs`** (via `-i` or the file list) automatically
+  redirects to its `_compensated.fcs` twin, generating it on demand.
+- **Files already ending in `_compensated.fcs`** are loaded as-is; no
+  compensation is applied.
+- **If there is neither a settings `.xml` nor any `_compensated.fcs`
+  file**, FreeFlow prints a WARNING and exits.
+
+Compensated files are plain FCS 3.1 (32-bit float) with the spillover
+keywords removed and a `FREEFLOW_COMPENSATED` marker added, so they open
+in any FCS tool.
 
 ---
 

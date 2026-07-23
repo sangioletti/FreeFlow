@@ -1,8 +1,0 @@
-Metadata-Version: 2.1
-Name: flowcyt
-Version: 1.0.0
-Summary: FCS flow-cytometry file viewer and gating tool
-Requires-Python: >=3.9
-Requires-Dist: numpy>=1.22
-Requires-Dist: matplotlib>=3.5
-Requires-Dist: requests>=2.28

@@ -54,6 +54,7 @@ from matplotlib.patches import Rectangle as RectPatch, Polygon as PolyPatch, Ell
 from ._widgets import Button, MacSlider, RadioButtons, install_tk_click_bridge
 
 from .reader import FCSData
+from . import compensation
 from .gating import (
     Gate, GateManager, PolygonGate, RectangleGate, EllipseGate, QuadrantGate,
     ThresholdGate,
@@ -509,9 +510,12 @@ class FlowCytApp:
         self._channel_display_names: list[str] = []
 
         # File selector state
-        self._fcs_files: list[str] = []   # List of absolute paths to FCS files
+        self._fcs_files: list[str] = []   # Browsable list (compensated files)
         self._fcs_file_idx: int = -1       # Index of currently loaded file
         self._scan_dir: str | None = None  # Directory being scanned
+        # Compensation matrix for the current directory (from settings XML),
+        # or None when the directory only holds pre-compensated files.
+        self._comp: compensation.CompMatrix | None = None
 
     # ================================================================ #
     #  Theme application — batch recolour after the layout is built
@@ -564,26 +568,42 @@ class FlowCytApp:
     #  File loading & file selector
     # ================================================================ #
     def _scan_fcs_files(self, directory: str):
-        """Scan a directory (and subdirectories one level deep) for .fcs files."""
-        import glob
+        """Prepare a directory for viewing and build the browsable file list.
+
+        Compensation is driven entirely by a settings XML in *directory*:
+        every compatible raw ``*.fcs`` gets a ``*_compensated.fcs`` twin,
+        and only those compensated files are browsable.  If the directory
+        has neither a settings XML nor any pre-existing ``*_compensated.fcs``
+        file, a WARNING is emitted and the process exits (per project spec).
+        """
         directory = os.path.abspath(directory)
-        # Scan current dir + one level of subdirs
-        patterns = [
-            os.path.join(directory, "*.fcs"),
-            os.path.join(directory, "*.FCS"),
-            os.path.join(directory, "*", "*.fcs"),
-            os.path.join(directory, "*", "*.FCS"),
-        ]
-        found = set()
-        for pat in patterns:
-            found.update(glob.glob(pat))
-        self._fcs_files = sorted(found)
+        try:
+            result = compensation.prepare_directory(directory)
+        except Exception as exc:
+            logger.exception("Failed to prepare directory %s", directory)
+            self._log(f"WARNING: could not prepare {directory}: {exc}")
+            result = compensation.DirectoryResult()
+
+        for note in result.messages:
+            self._log(note)
+
+        self._comp = result.comp
+        self._fcs_files = sorted(result.generated)
         self._scan_dir = directory
+
+        if not result.has_usable_files:
+            msg = (
+                f"No compensation settings XML and no *_compensated.fcs "
+                f"files found in {directory}. Nothing to display."
+            )
+            self._log(f"WARNING: {msg}")
+            print(f"\n{'=' * 70}\n  WARNING: {msg}\n{'=' * 70}\n",
+                  file=sys.stderr)
+            sys.exit(1)
+
         self._update_file_label()
-        if self._fcs_files:
-            self._log(f"Found {len(self._fcs_files)} FCS file(s) in {directory}")
-        else:
-            self._log(f"No FCS files found in {directory}")
+        self._log(f"{len(self._fcs_files)} compensated file(s) ready in "
+                  f"{directory}")
 
     def _update_file_label(self):
         """Update the file selector button label."""
@@ -623,11 +643,64 @@ class FlowCytApp:
         self._update_file_label()
         self._open_file(path)
 
+    def _resolve_openable(self, path: str) -> str | None:
+        """Return the compensated file to actually load for *path*.
+
+        ``*_compensated.fcs`` paths are returned unchanged.  A raw ``*.fcs``
+        is redirected to its compensated twin, which is generated on demand
+        from the directory's settings XML if it does not yet exist.  Returns
+        None (after logging a WARNING) when the file cannot be compensated.
+        """
+        if compensation.is_compensated_file(path):
+            return path
+
+        # Make sure the containing directory has been prepared so that the
+        # compensation matrix is loaded and twins have been generated.
+        file_dir = os.path.dirname(os.path.abspath(path))
+        if file_dir != self._scan_dir:
+            self._scan_fcs_files(file_dir)
+
+        twin = compensation.compensated_path(path)
+        if os.path.exists(twin):
+            return twin
+
+        if self._comp is None:
+            self._log(
+                f"WARNING: {os.path.basename(path)} is not compensated and "
+                "no settings XML is available to compensate it — skipped."
+            )
+            return None
+
+        try:
+            out = compensation.generate_compensated(path, self._comp)
+        except Exception as exc:
+            logger.exception("Failed to compensate %s", path)
+            self._log(f"WARNING: could not compensate "
+                      f"{os.path.basename(path)}: {exc}")
+            return None
+        if out is None:
+            self._log(
+                f"WARNING: {os.path.basename(path)} is incompatible with the "
+                "compensation matrix (missing channels) — skipped."
+            )
+            return None
+        if out not in self._fcs_files:
+            self._fcs_files = sorted(self._fcs_files + [out])
+        return out
+
     def _open_file(self, path: str):
         """Load an FCS file and update all UI elements.
 
         Gates, parent selection, and X/Y channels are all preserved.
+
+        Raw (uncompensated) files are never displayed directly: opening one
+        redirects to its ``*_compensated.fcs`` twin, generating it from the
+        directory's settings XML on demand if needed.
         """
+        path = self._resolve_openable(path)
+        if path is None:
+            return
+
         # Save current channel names BEFORE loading new file
         old_channel_names: list[str] = []
         if self.fcs is not None:
@@ -659,11 +732,13 @@ class FlowCytApp:
         num_gates = len(self.gate_mgr.gates)
         self._log(f"Loaded: {os.path.basename(path)}")
         self._log(f"Events: {self.fcs.num_events:,}, Channels: {self.fcs.num_channels}")
-        # Surface the compensation status (no matrix, diagonal/no-spillover
-        # matrix, or a genuine non-diagonal matrix). Each message carries its
-        # own prefix, so log it verbatim.
-        for note in self.fcs.compensation_warnings:
-            self._log(note)
+        # Compensation is applied up-front from the settings XML; a loaded
+        # file is always the compensated twin (name ends in _compensated.fcs).
+        src = self.fcs.metadata.get("FREEFLOW_COMP_SOURCE")
+        if src:
+            self._log(f"Compensated from settings XML: {src}")
+        elif self.fcs.is_compensated:
+            self._log("Compensated data.")
         if num_gates > 0:
             self._log(f"Keeping {num_gates} existing gate(s)")
 

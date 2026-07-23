@@ -22,6 +22,12 @@ deepseek_api_key
 *.fcs.gates.json
 *.fcs.markers.json
 
+# Compensated FCS files generated from the settings XML at runtime
+*_compensated.fcs
+
+# Pytest cache
+.pytest_cache/
+
 # Local screenshot exports
 *.png
 !docs/**/*.png
